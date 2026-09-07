@@ -1,0 +1,53 @@
+HierarchyOrganizer License 1.0
+Copyright (c) 2026 Blaubluter. All rights reserved except as granted below.
+1. Scope
+"Software" means the HierarchyOrganizer code and documentation distributed
+with this license. "Licensor" means Blaubluter, to the extent that Blaubluter
+owns or is authorized to license the relevant rights. Separately licensed
+third-party materials remain subject to their own licenses. This license
+does not claim exclusive ownership of general ideas, concepts or functionality.
+2. Permitted use
+The Licensor grants you a worldwide, royalty-free, non-exclusive license to
+download, copy, use and modify the Software, including for developing personal,
+educational and commercial games and other projects. You may sell games and
+other works made using the Software. Using this editor tool does not place
+your game's own code or assets under this license, and does not require a
+credit in the game merely because you used the tool during development.
+3. Free redistribution
+You may share the Software and modified versions without charge, provided
+that you include this license, preserve existing copyright and attribution
+notices, and identify substantive modifications and their authors clearly.
+Recipients receive the permissions in this license directly from the Licensor
+for the original Software. Modified versions must be distributed subject to
+these same conditions, without granting permission to resell the Software.
+4. No sale of the Software
+Without separate written permission from the Licensor, you may not sell,
+rent, sublicense for a fee, or otherwise charge for access to the Software
+or modified versions of it. You may not include it as an editor tool in a
+paid asset pack, paid plugin, paid tool collection or paid subscription.
+Charging for a game or other work developed using the Software is permitted
+under section 2; charging for distribution of the Software itself is not.
+5. Attribution and accurate origin
+You must not claim that you created the original Software, remove or falsify
+its attribution notices, or present a copied or modified version as an
+independent original implementation. You may accurately claim authorship of
+your own modifications. Do not imply endorsement by the Licensor.
+These conditions concern this Software and its copies or modifications;
+they do not prohibit independently implementing a similar general idea.
+6. Reserved rights and mandatory law
+Rights not expressly granted are reserved. This license does not grant
+trademark rights or rights in third-party materials beyond those held by the
+Licensor. Nothing in this license limits rights that applicable law makes
+non-waivable.
+7. No guarantee
+To the extent permitted by applicable law, the Software is provided "as is",
+without warranties of fitness, uninterrupted operation or freedom from bugs.
+No provision excludes liability that cannot legally be excluded, including
+applicable mandatory liability for intent, gross negligence or personal injury.
+8. Breach
+If you breach this license, you must stop the prohibited activity. The Licensor
+may terminate the permissions granted to you if you fail to remedy a remediable
+breach within 30 days after receiving written notice describing it. Rights and
+remedies available under applicable law remain unaffected.
+For permission beyond this license, contact Blaubluter through the official
+repository: https://github.com/Blaubluter/HierarchyOrganizerUnity6.6
