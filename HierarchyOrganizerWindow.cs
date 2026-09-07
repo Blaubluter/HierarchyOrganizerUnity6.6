@@ -2449,6 +2449,9 @@ public class HierarchyOrganizerWindow : EditorWindow
     void ShowSettingsMenu()
     {
         var menu = new GenericMenu();
+        menu.AddItem(new GUIContent("Nach Updates suchen …"), false, HierarchyOrganizerUpdater.CheckForUpdates);
+        menu.AddDisabledItem(new GUIContent("Version " + HierarchyOrganizerUpdater.Version));
+        menu.AddSeparator("");
 
         menu.AddItem(new GUIContent("Design & Helligkeit/Modern Dark (Empfohlen)"), _currentTheme == ThemeMode.ModernDark, () => { _currentTheme = ThemeMode.ModernDark; StateChanged(); });
         menu.AddItem(new GUIContent("Design & Helligkeit/Extra Hell"),              _currentTheme == ThemeMode.ExtraBright, () => { _currentTheme = ThemeMode.ExtraBright; StateChanged(); });
