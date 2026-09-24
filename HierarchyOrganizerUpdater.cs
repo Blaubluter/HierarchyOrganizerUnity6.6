@@ -11,7 +11,10 @@ using UnityEngine.Networking;
 
 public static class HierarchyOrganizerUpdater
 {
-    public const string Version = "1.7.0";
+    public const string Version = "2.0.0";
+    public const string VersionName = "2.0 Master Update";
+    static bool English => EditorPrefs.GetBool("HierarchyOrganizer.LanguageEnglish", true);
+    static string T(string german, string english) => English ? english : german;
     const string Repo = "Blaubluter/HierarchyOrganizerUnity6.6";
     const long MaxZipBytes = 10 * 1024 * 1024;
     static UnityWebRequest request;
@@ -37,16 +40,16 @@ public static class HierarchyOrganizerUpdater
     [MenuItem("Window/Hierarchy Organizer Updates/Nach Updates suchen")]
     public static void CheckForUpdates()
     {
-        if (request != null) { Show("Eine Update-Anfrage läuft bereits."); return; }
+        if (request != null) { Show(T("Eine Update-Anfrage läuft bereits.", "An update request is already running.")); return; }
         if (EditorApplication.isPlayingOrWillChangePlaymode || EditorApplication.isCompiling)
-        { Show("Bitte den Play-Modus und die Kompilierung zuerst beenden."); return; }
-        Begin("https://api.github.com/repos/" + Repo + "/releases/latest", "Suche nach Updates …", () =>
+        { Show(T("Bitte den Play-Modus und die Kompilierung zuerst beenden.", "Exit Play Mode and wait for compilation to finish first.")); return; }
+        Begin("https://api.github.com/repos/" + Repo + "/releases/latest", T("Suche nach Updates …", "Checking for updates…"), () =>
         {
             var release = JsonUtility.FromJson<Release>(request.downloadHandler.text);
             if (release == null || release.draft || release.prerelease ||
                 !System.Version.TryParse((release.tag_name ?? "").TrimStart('v', 'V'), out var latest))
                 throw new InvalidDataException("Die Release-Versionsnummer ist ungültig.");
-            if (latest <= new System.Version(Version)) { Show("Version " + Version + " ist aktuell."); return; }
+            if (latest <= new System.Version(Version)) { Show(T("Version " + VersionName + " ist aktuell.", "Version " + VersionName + " is up to date.")); return; }
             var asset = release.assets?.FirstOrDefault(a => a.name == "HierarchyOrganizer-" + latest + ".zip");
             if (asset == null || asset.size <= 0 || asset.size > MaxZipBytes ||
                 !Uri.TryCreate(asset.browser_download_url, UriKind.Absolute, out var url) ||
@@ -56,15 +59,16 @@ public static class HierarchyOrganizerUpdater
             string notes = release.body ?? "";
             if (notes.Length > 2200) notes = notes.Substring(0, 2200) + "…";
             if (EditorUtility.DisplayDialog("Hierarchy Organizer Update",
-                "Installiert: " + Version + "\nVerfügbar: " + latest + "\n\n" + notes +
-                "\n\nDie bisherigen Dateien werden gesichert. Unity kompiliert anschließend neu.", "Installieren", "Abbrechen"))
+                T("Installiert: " + VersionName + "\nVerfügbar: " + latest, "Installed: " + VersionName + "\nAvailable: " + latest) + "\n\n" + notes +
+                T("\n\nDie bisherigen Dateien werden gesichert. Unity kompiliert anschließend neu.", "\n\nExisting files will be backed up. Unity will then recompile."),
+                T("Installieren", "Install"), T("Abbrechen", "Cancel")))
                 EditorApplication.delayCall += () => Download(asset, latest.ToString());
         });
     }
 
     static void Download(Asset asset, string expectedVersion)
     {
-        Begin(asset.browser_download_url, "Update herunterladen …", () =>
+        Begin(asset.browser_download_url, T("Update herunterladen …", "Downloading update…"), () =>
         {
             byte[] bytes = request.downloadHandler.data;
             if (bytes.LongLength != asset.size || bytes.LongLength > MaxZipBytes)

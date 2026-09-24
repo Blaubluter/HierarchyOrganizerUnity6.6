@@ -18,27 +18,12 @@ public class HierarchyOrganizerWindow : EditorWindow
     // ══════════════════════════════════════════════
 
     [System.Serializable]
-    public class HistoryEntry
-    {
-        public EntityId entityId;
-        public string name;
-        public string scenePath;
-        public HistoryEntry(GameObject go)
-        {
-            entityId = go.GetEntityId();
-            name       = go.name;
-            scenePath  = BuildPath(go);
-        }
-        public GameObject Resolve() => EditorUtility.EntityIdToObject(entityId) as GameObject;
-    }
-
-    [System.Serializable]
     public class TabData
     {
         public string  name           = "Tab";
         public bool    renaming;
         public string  renameBuffer   = "";
-        public int     viewMode       = 1;   // 1=Tab-Inhalt (Pinned), 0=Ganze Szene (Hierarchy), 2=Verlauf (History)
+        public int     viewMode       = 1;   // 1=Tab-Inhalt (Pinned), 0=Ganze Szene (Hierarchy)
         public string  searchQuery    = "";
         public string  tagFilter      = "";
         public int     layerFilter    = -1;  // -1 = alle
@@ -46,13 +31,20 @@ public class HierarchyOrganizerWindow : EditorWindow
         public string  customHexColor = "";  // Eigene Farbe (z.B. "#3B82F6")
         public string  iconEmoji      = "";  // Optionales Emoji (z.B. "📁", "🎮", "💡")
         public int     tabStyle       = 0;   // 0=Akzentlinie, 1=Volle Tönung, 2=Pille
+        public int     tabKind        = 0;   // 0=Hierarchie, 1=Projekt (wichtig für leere Tabs)
+        public string  projectSourceId = "";
+        public string  groupedProjectSourceId = "";
         public bool    locked         = false;
         public string  notes          = "";
         public bool    showNotes      = false;
         public Vector2 scroll;
         public List<string> folderGuids = new List<string>();
+        public List<string> folderNames = new List<string>();
+        public bool showFolderNames = true;
+        public string selectedProjectFolderGuid = "";
+        public Vector2 projectSubTabScroll;
+        [System.NonSerialized] public string newFolderName = "";
         public List<EntityId>     pinnedIDs   = new List<EntityId>();
-        public List<HistoryEntry> history     = new List<HistoryEntry>();
         public string  quickFilter    = "";  // "", "lights", "ui", "colliders", "audio", "vfx", "missing", "inactive", "favorites"
     }
 
@@ -111,8 +103,6 @@ public class HierarchyOrganizerWindow : EditorWindow
 
     List<TabData>                 _tabs               = new List<TabData>();
     int                           _selectedTab;
-    bool                          _recordEnabled      = true;
-    int                           _maxHistory         = 50;
     HashSet<EntityId>             _expanded           = new HashSet<EntityId>();
     HashSet<EntityId>             _favorites          = new HashSet<EntityId>();
     Dictionary<EntityId, string>  _customObjectColors = new Dictionary<EntityId, string>();
@@ -125,9 +115,15 @@ public class HierarchyOrganizerWindow : EditorWindow
     bool                          _showComponentIcons = true;
     bool                          _showHierarchyLines = true;
     bool                          _showQuickFilterBar = true;
+    bool                          _showQuickFilterLabels;
+    bool                          _showTagLayerBar;
     bool                          _showTooltips       = true;
     int                           _autosaveIntervalMinutes = 5;
     bool                          _autoNameTabs;
+    bool                          _englishUI = true;
+    const string                 LanguagePrefKey = "HierarchyOrganizer.LanguageEnglish";
+    const string                 HierarchyTabName = "Hierarchie";
+    const string                 LegacyMainTabName = "Main";
 
     // Drag & Reorder
     int                           _dragOverTab        = -1;
@@ -135,8 +131,13 @@ public class HierarchyOrganizerWindow : EditorWindow
     EntityId                      _dragSourceID       = default;
     Vector2                       _dragStartPos;
     const float                   DragThreshold       = 8f;
+    const string                  EntryDragKey        = "HierarchyOrganizer.EntryDrag";
+    EntityId                      _entryDropTargetID  = default;
+    int                           _entryDropZone      = -1; // 0=vorher, 1=Kind, 2=nachher
+    TabData                       _entryDropTab;
     Vector2                       _globalScroll;
     Vector2                       _quickFilterScroll;
+    bool                          _quickFiltersExpanded;
 
     readonly List<GameObject> _visibleSelectionRows = new List<GameObject>();
     readonly List<GameObject> _drawnSelectionRows = new List<GameObject>();
@@ -144,12 +145,22 @@ public class HierarchyOrganizerWindow : EditorWindow
     readonly HashSet<EntityId> _selectedIDs = new HashSet<EntityId>();
     readonly Dictionary<EntityId, bool> _filterMatchCache = new Dictionary<EntityId, bool>();
     readonly Dictionary<EntityId, Component[]> _componentCache = new Dictionary<EntityId, Component[]>();
+    readonly Dictionary<EntityId, string> _tabMembershipCache = new Dictionary<EntityId, string>();
     readonly List<GameObject> _filteredSceneCache = new List<GameObject>();
     string _filteredSceneCacheKey;
     int _hierarchyVersion;
     int _stateVersion;
     GameObject _selectionAnchor;
     GameObject _pendingSingleSelection;
+    EntityId _lastClickedObjectID;
+    double _lastClickedObjectTime = -1;
+
+    sealed class OrganizerEntryDrag
+    {
+        public TabData tab;
+        public EntityId sourceID;
+        public bool pinnedRoot;
+    }
 
     // Die Farbzuordnung folgt den Pins; sie verändert keine Objektfarben.
     class TabColorGroup
@@ -160,9 +171,49 @@ public class HierarchyOrganizerWindow : EditorWindow
         public readonly HashSet<EntityId> pinnedIDs = new HashSet<EntityId>();
     }
 
+    sealed class QuickFilterOption
+    {
+        public readonly string key;
+        public readonly GUIContent compactContent;
+        public readonly GUIContent labeledContent;
+
+        public QuickFilterOption(string key, string icon, string label, string tooltip)
+        {
+            this.key = key;
+            compactContent = new GUIContent(icon, tooltip);
+            labeledContent = new GUIContent(icon + " " + label, tooltip);
+        }
+    }
+
+    static readonly QuickFilterOption[] QuickFilterOptions =
+    {
+        new QuickFilterOption("",          "●",  "Alle",       "Alle Objekte anzeigen und den Schnellfilter zurücksetzen."),
+        new QuickFilterOption("triggers",  "⚡", "Trigger",    "Trigger-, Instruction- und EventTrigger-Objekte anzeigen."),
+        new QuickFilterOption("actions",   "🎬", "Actions",    "Actions, Instructions, Sequenzen und Bedingungen anzeigen."),
+        new QuickFilterOption("character", "👤", "Charaktere", "Charaktere, Player, NPCs, Gegner und Einheiten anzeigen."),
+        new QuickFilterOption("variables", "📊", "Variablen",  "Variablen, Properties, Blackboards, Stats und Inventare anzeigen."),
+        new QuickFilterOption("lights",    "💡", "Licht",      "Lichter, Reflection Probes und Light Probe Groups anzeigen."),
+        new QuickFilterOption("cameras",   "🎥", "Kameras",    "Kameras, Cinemachine-Objekte und Shots anzeigen."),
+        new QuickFilterOption("ui",        "🖼️", "UI",         "UI-Objekte mit RectTransform oder Canvas anzeigen."),
+        new QuickFilterOption("colliders", "🔲", "Collider",   "Objekte mit 3D- oder 2D-Collidern anzeigen."),
+        new QuickFilterOption("physics",   "⚖️", "Physik",     "Rigidbodies, Joints und Constant Forces anzeigen."),
+        new QuickFilterOption("navmesh",   "🏃", "NavMesh",    "NavMesh Agents und Obstacles anzeigen."),
+        new QuickFilterOption("audio",     "🔊", "Audio",      "Audio Sources, Listener und Reverb Zones anzeigen."),
+        new QuickFilterOption("vfx",       "💥", "VFX",        "Partikel, Trails, Lines und Visual Effects anzeigen."),
+        new QuickFilterOption("missing",   "⚠️", "Fehlend",    "Objekte mit fehlenden Komponenten anzeigen."),
+        new QuickFilterOption("favorites", "⭐", "Favoriten",  "Nur als Favorit markierte Objekte anzeigen."),
+        new QuickFilterOption("inactive",  "👁️", "Inaktiv",    "Nur inaktive Objekte anzeigen.")
+    };
+
     readonly List<TabColorGroup> _tabColorGroups = new List<TabColorGroup>();
     TabData _sceneColorFilterTab;
     TabColorGroup _activeSceneColorGroup;
+    int _tabColorGroupsVersion = -1;
+
+    // Selten veränderte Editorlisten werden nicht bei jedem IMGUI-Event neu erzeugt.
+    string[] _tagFilterOptions;
+    string[] _layerFilterOptions;
+    int[] _layerFilterValues;
 
     // Tooltip
     GameObject                    _hoveredGO;
@@ -173,7 +224,7 @@ public class HierarchyOrganizerWindow : EditorWindow
     // Style-Cache
     GUIStyle _stTabActive, _stTabNormal, _stHeader;
     GUIStyle _stEntryName, _stEntryPath, _stBadge;
-    GUIStyle _stNotes, _stFilterChip, _stFilterChipActive;
+    GUIStyle _stNotes, _stFilterChip, _stFilterChipActive, _stPrefabCardName;
 
     // Autosave
     const int    AutosaveMaxFiles   = 5;
@@ -183,10 +234,12 @@ public class HierarchyOrganizerWindow : EditorWindow
     Scene _dataScene;
     HierarchyOrganizerSceneData _sceneStorage;
     bool _stateLoaded, _writingState, _suspendPersistence, _loadFailed;
+    bool _persistenceSuppressedUntilOrganizerChange;
     bool _stateDirty;
     Scene _closingScene;
     string _lastSavedJson = "";
     double _nextStateSync;
+    double _nextMaintenanceTime;
 
     public TabData CurrentTab => _tabs.Count > 0
         ? _tabs[Mathf.Clamp(_selectedTab, 0, _tabs.Count - 1)]
@@ -205,7 +258,10 @@ public class HierarchyOrganizerWindow : EditorWindow
             }
             sceneKey = "Unsaved_" + session + "_" + _dataScene.handle;
         }
-        return System.IO.Path.Combine(Application.dataPath, "JustDoIt_Tools", "HierarchyOrganizer", "HO_Backup", sceneKey);
+        // Backups are editor-local data, not assets. Keeping them in UserSettings
+        // avoids imports, postprocessors and preview-cache invalidation on autosave.
+        string projectRoot = System.IO.Path.GetDirectoryName(Application.dataPath);
+        return System.IO.Path.Combine(projectRoot, "UserSettings", "HierarchyOrganizer", "Backups", sceneKey);
     }
 
     // ══════════════════════════════════════════════
@@ -264,11 +320,10 @@ public class HierarchyOrganizerWindow : EditorWindow
 
     public Color GetTabColor(TabData tab)
     {
-        if (tab == null) return PresetColors[0].color;
-        if (!string.IsNullOrEmpty(tab.customHexColor) && ColorUtility.TryParseHtmlString(tab.customHexColor, out Color c))
-            return c;
-        int idx = Mathf.Clamp(tab.colorIndex, 0, PresetColors.Length - 1);
-        return PresetColors[idx].color;
+        if (tab == null) return new Color(0.90f, 0.28f, 0.28f);
+        return IsProjectTab(tab)
+            ? new Color(0.24f, 0.72f, 0.36f)
+            : new Color(0.90f, 0.28f, 0.28f);
     }
 
     // ══════════════════════════════════════════════
@@ -298,6 +353,7 @@ public class HierarchyOrganizerWindow : EditorWindow
                 if (!w.CurrentTab.pinnedIDs.Contains(id))
                 {
                     w.CurrentTab.pinnedIDs.Add(id);
+                    w._expanded.Add(id);
                     added++;
                 }
             }
@@ -318,7 +374,11 @@ public class HierarchyOrganizerWindow : EditorWindow
     void OnEnable()
     {
         wantsMouseMove = true;
+        _englishUI = EditorPrefs.GetBool(LanguagePrefKey, true);
+        _prefabPreviewSize = Mathf.Clamp(EditorPrefs.GetFloat(PreviewSizePrefKey, 104f), 64f, 240f);
         EditorApplication.projectChanged += RefreshFolderAssets;
+        DragAndDrop.AddDropHandlerV2((DragAndDrop.SceneDropHandler)ObserveProjectSceneDrop);
+        DragAndDrop.AddDropHandlerV2((DragAndDrop.HierarchyDropHandlerV2)ObserveProjectHierarchyDrop);
         _suspendPersistence = EditorApplication.isPlayingOrWillChangePlaymode;
         LoadState();
 
@@ -337,6 +397,8 @@ public class HierarchyOrganizerWindow : EditorWindow
     void OnDisable()
     {
         EditorApplication.projectChanged -= RefreshFolderAssets;
+        DragAndDrop.RemoveDropHandlerV2((DragAndDrop.SceneDropHandler)ObserveProjectSceneDrop);
+        DragAndDrop.RemoveDropHandlerV2((DragAndDrop.HierarchyDropHandlerV2)ObserveProjectHierarchyDrop);
         Selection.selectionChanged         -= OnSelectionChanged;
         EditorApplication.hierarchyChanged -= OnHierarchyChanged;
         EditorApplication.update           -= AutosaveCheck;
@@ -353,22 +415,9 @@ public class HierarchyOrganizerWindow : EditorWindow
 
     void OnSelectionChanged()
     {
-        var go = Selection.activeGameObject;
-        if (!IsObjectInContext(go) || CurrentTab == null) return;
-
-        bool changed = false;
-        foreach (var tab in _tabs)
-        {
-            if (tab.locked && tab != CurrentTab) continue;
-            if (!_recordEnabled) continue;
-            tab.history.RemoveAll(e => e.entityId == go.GetEntityId());
-            tab.history.Insert(0, new HistoryEntry(go));
-            if (tab.history.Count > _maxHistory)
-                tab.history.RemoveRange(_maxHistory, tab.history.Count - _maxHistory);
-            changed = true;
-        }
-        if (changed) StateChanged();
-        else Repaint();
+        // Auswahländerungen beeinflussen nur die Hervorhebung. Sie verändern keine
+        // Organizer-Daten mehr und lösen deshalb auch keinen Speichervorgang aus.
+        Repaint();
     }
 
     void OnHierarchyChanged()
@@ -391,10 +440,12 @@ public class HierarchyOrganizerWindow : EditorWindow
     {
         _filteredSceneCacheKey = null;
         _filterMatchCache.Clear();
+        _tabMembershipCache.Clear();
     }
 
     internal void StateChanged()
     {
+        _persistenceSuppressedUntilOrganizerChange = false;
         _stateDirty = true;
         _stateVersion++;
         _nextStateSync = EditorApplication.timeSinceStartup + 0.75;
@@ -411,6 +462,8 @@ public class HierarchyOrganizerWindow : EditorWindow
         wantsMouseMove = true;
         EnsureSceneContext();
         EnsureStyles();
+        _prefabCardControlId = GUIUtility.GetControlID("HierarchyOrganizer.PrefabCardDrag".GetHashCode(), FocusType.Passive);
+        HandlePrefabCardGesture();
         if (!_stateLoaded)
         {
             DrawHint(_loadFailed ? "Die Organizer-Daten dieser Szene konnten nicht geladen werden. Details stehen in der Console."
@@ -429,23 +482,28 @@ public class HierarchyOrganizerWindow : EditorWindow
 
         EditorGUI.BeginChangeCheck();
         DrawToolbar();
+
+        // Alle Such- und Filterelemente bleiben fest ganz oben. Sie gehören zum
+        // aktuell gewählten Tab; ein Tab-Wechsel aktualisiert sie im nächsten Repaint.
+        var tab = CurrentTab;
+        if (tab != null)
+        {
+            bool isMainTab = IsHierarchyTab(tab);
+            tab.viewMode = isMainTab ? 0 : 1;
+
+            if (!string.IsNullOrEmpty(tab.searchQuery)) tab.searchQuery = "";
+            _globalSearch = false;
+            _globalQuery = "";
+            if (_showTagLayerBar)
+                DrawFilterBar(tab);
+
+            if (_showQuickFilterBar)
+                DrawQuickFilterChips(tab);
+        }
+
         DrawTabBar();
 
-        EditorGUILayout.BeginHorizontal();
-        GUILayout.Space(6);
-        if (GUILayout.Button(new GUIContent("Main neu einlesen",
-            "Öffnet Main mit der gesamten aktuellen Szene und setzt dort Such- und Farbfilter zurück."),
-            EditorStyles.miniButton, GUILayout.Width(140), GUILayout.Height(24)))
-            RefreshMainView();
-        GUILayout.Space(4);
-        _autoNameTabs = GUILayout.Toggle(_autoNameTabs,
-            new GUIContent(_autoNameTabs ? "Auto-Name: AN" : "Auto-Name: AUS",
-                "Leere Tabs beim Ablegen nach dem ersten Objekt benennen. Main und gesperrte Tabs behalten ihren Namen."),
-            EditorStyles.miniButton, GUILayout.Width(125), GUILayout.Height(24));
-        GUILayout.FlexibleSpace();
-        EditorGUILayout.EndHorizontal();
-
-        var tab = CurrentTab;
+        tab = CurrentTab;
         if (tab == null)
         {
             if (EditorGUI.EndChangeCheck()) StateChanged();
@@ -457,21 +515,8 @@ public class HierarchyOrganizerWindow : EditorWindow
         for (int i = 0; i < selectedObjects.Length; i++)
             if (selectedObjects[i] != null) _selectedIDs.Add(selectedObjects[i].GetEntityId());
 
-        if (_globalSearch)
-            DrawGlobalSearchBar();
-        else
-            DrawSearchBar(tab);
-
-        if (_showQuickFilterBar)
-            DrawQuickFilterChips(tab);
-
-        DrawViewModeBar(tab);
-
+        _sceneColorFilterTab = null;
         _activeSceneColorGroup = null;
-        if (tab.viewMode == 0 || (_globalSearch && !string.IsNullOrEmpty(_globalQuery)))
-            DrawTabColorFilterBar(tab);
-
-        if (tab.showNotes) DrawNotesArea(tab);
 
         if (Event.current.type == EventType.Repaint)
         {
@@ -503,16 +548,38 @@ public class HierarchyOrganizerWindow : EditorWindow
 
     // ── Toolbar ─────────────────────────────────
 
+    bool CompactLayout => position.width < 390f;
+    string T(string german, string english) => _englishUI ? english : german;
+
     void DrawToolbar()
     {
+        bool compact = CompactLayout;
         EditorGUILayout.BeginHorizontal(EditorStyles.toolbar);
 
-        GUILayout.Label("Hierarchy Organizer", _stHeader ?? EditorStyles.boldLabel, GUILayout.ExpandWidth(true));
+        if (!compact)
+            GUILayout.Label("Hierarchy Organizer", _stHeader ?? EditorStyles.boldLabel, GUILayout.ExpandWidth(true));
+
+        if (GUILayout.Button(new GUIContent(_englishUI ? "EN" : "DE",
+                T("Oberfläche auf Englisch umstellen.", "Switch the interface to German.")),
+            EditorStyles.toolbarButton, GUILayout.Width(27f)))
+        {
+            _englishUI = !_englishUI;
+            EditorPrefs.SetBool(LanguagePrefKey, _englishUI);
+            Repaint();
+        }
+
+        if (GUILayout.Button(new GUIContent(compact ? "↻" : "↻ Hierarchie",
+            T("Hierarchie neu einlesen: Öffnet den Hierarchie-Tab mit der gesamten aktuellen Szene und setzt dort alle Filter zurück.",
+              "Refresh Hierarchy: Opens the Hierarchy tab with the complete current scene and resets all filters.")),
+            EditorStyles.toolbarButton, GUILayout.Width(compact ? 25f : 56f)))
+            RefreshMainView();
 
         if (!string.IsNullOrEmpty(_lastAutosaveLabel))
         {
             var sc = GUI.color; GUI.color = new Color(0.6f, 0.95f, 0.65f);
-            if (GUILayout.Button("💾 " + _lastAutosaveLabel, EditorStyles.toolbarButton, GUILayout.Width(72)))
+            if (GUILayout.Button(new GUIContent(compact ? "💾" : "💾 " + _lastAutosaveLabel,
+                    T("Ordner der automatischen Sicherungen öffnen.", "Open the automatic-backup folder.")),
+                EditorStyles.toolbarButton, GUILayout.Width(compact ? 25f : 72f)))
             {
                 string folder = GetAutosaveFolder();
                 if (System.IO.Directory.Exists(folder)) EditorUtility.RevealInFinder(folder);
@@ -520,26 +587,49 @@ public class HierarchyOrganizerWindow : EditorWindow
             GUI.color = sc;
         }
 
-        var gCol = _globalSearch ? new Color(1f, 0.88f, 0.25f) : new Color(0.85f, 0.85f, 0.85f);
+        var currentTab = CurrentTab;
+        bool hasTagLayerFilter = currentTab != null &&
+            (!string.IsNullOrEmpty(currentTab.tagFilter) || currentTab.layerFilter >= 0);
+        var gCol = _showTagLayerBar ? new Color(0.40f, 0.90f, 1f)
+            : hasTagLayerFilter ? new Color(1f, 0.72f, 0.25f) : new Color(0.75f, 0.75f, 0.75f);
         var old = GUI.color; GUI.color = gCol;
-        if (GUILayout.Button("⌕ Global", EditorStyles.toolbarButton, GUILayout.Width(62)))
+        if (GUILayout.Button(new GUIContent("T/L", _showTagLayerBar
+                ? T("Tag- und Layer-Filter ausblenden.", "Hide tag and layer filters.")
+                : hasTagLayerFilter ? T("Tag- und Layer-Filter einblenden – ein Filter ist aktiv.", "Show tag and layer filters — a filter is active.")
+                : T("Tag- und Layer-Filter einblenden.", "Show tag and layer filters.")),
+            EditorStyles.toolbarButton, GUILayout.Width(30f)))
+            _showTagLayerBar = !_showTagLayerBar;
+        GUI.color = old;
+
+        if (GUILayout.Button(new GUIContent(compact ? "+" : "+ Obj",
+                T("Neues Szenenobjekt erstellen", "Create a new scene object")),
+            EditorStyles.toolbarButton, GUILayout.Width(compact ? 25f : 43f)))
+            ShowCreateObjectMenu();
+
+        float autoPulse = 0.5f + 0.5f * Mathf.Sin((float)EditorApplication.timeSinceStartup * Mathf.PI);
+        var autoNameCol = _autoNameTabs
+            ? Color.Lerp(new Color(0.62f, 0.12f, 0.10f), new Color(1f, 0.48f, 0.38f), autoPulse)
+            : new Color(0.75f, 0.75f, 0.75f);
+        GUI.color = autoNameCol;
+        if (GUILayout.Button(new GUIContent(compact ? (_autoNameTabs ? "●" : "○") : (_autoNameTabs ? "● Auto" : "○ Auto"),
+            T("Auto: " + (_autoNameTabs ? "AN" : "AUS") + "\nWenn aktiv, erzeugen platzierte Projekt-Prefabs automatisch eine Gruppe und einen Hierarchie-Tab. Leere Tabs werden nach dem ersten Objekt benannt.",
+              "Auto: " + (_autoNameTabs ? "ON" : "OFF") + "\nWhen enabled, placed project prefabs automatically create a group and hierarchy tab. Empty tabs are named after their first object.")),
+            EditorStyles.toolbarButton, GUILayout.Width(compact ? 25f : 55f)))
         {
-            _globalSearch = !_globalSearch;
-            _globalQuery  = "";
+            _autoNameTabs = !_autoNameTabs;
+            if (!_autoNameTabs) DragAndDrop.SetGenericData(ProjectDragKey, null);
+            StateChanged();
+            Repaint();
         }
         GUI.color = old;
 
-        var recCol = _recordEnabled ? new Color(0.35f, 0.95f, 0.45f) : new Color(0.75f, 0.75f, 0.75f);
-        GUI.color = recCol;
-        if (GUILayout.Button(_recordEnabled ? "● REC" : "○ REC", EditorStyles.toolbarButton, GUILayout.Width(54)))
-            _recordEnabled = !_recordEnabled;
-        GUI.color = old;
-
         GUI.color = new Color(0.7f, 0.95f, 0.75f);
-        if (GUILayout.Button("↑ Save", EditorStyles.toolbarButton, GUILayout.Width(48)))
+        if (GUILayout.Button(new GUIContent(compact ? "↑" : "↑ Save", T("Backup speichern.", "Save backup.")),
+            EditorStyles.toolbarButton, GUILayout.Width(compact ? 25f : 48f)))
             SaveBackup();
         GUI.color = new Color(0.7f, 0.85f, 1f);
-        if (GUILayout.Button("↓ Load", EditorStyles.toolbarButton, GUILayout.Width(48)))
+        if (GUILayout.Button(new GUIContent(compact ? "↓" : "↓ Load", T("Backup laden.", "Load backup.")),
+            EditorStyles.toolbarButton, GUILayout.Width(compact ? 25f : 48f)))
             LoadBackup();
         GUI.color = old;
 
@@ -547,6 +637,163 @@ public class HierarchyOrganizerWindow : EditorWindow
             ShowSettingsMenu();
 
         EditorGUILayout.EndHorizontal();
+    }
+
+    void ShowCreateObjectMenu()
+    {
+        var tab = CurrentTab;
+        if (tab == null || IsProjectTab(tab))
+        {
+            ShowNotification(new GUIContent(T("Objekte können nur in Hierarchie-Tabs erstellt werden.",
+                "Objects can only be created from hierarchy tabs.")));
+            return;
+        }
+        if (tab.locked)
+        {
+            ShowNotification(new GUIContent(T("Dieser Tab ist gesperrt.", "This tab is locked.")));
+            return;
+        }
+
+        var menu = new GenericMenu();
+        try
+        {
+            AddUnityCreateItems(menu, tab);
+        }
+        catch (System.Exception exception)
+        {
+            Debug.LogException(exception);
+            ShowNotification(new GUIContent(T("Unitys Erstellen-Menü konnte nicht geladen werden.",
+                "Could not load Unity's Create menu.")));
+            return;
+        }
+        menu.ShowAsContext();
+    }
+
+    // Use Unity's menu builder so package entries, validation, ordering and
+    // temporary MenuCommand contexts match the native Hierarchy.
+    void AddUnityCreateItems(GenericMenu menu, TabData tab)
+    {
+        const System.Reflection.BindingFlags flags = System.Reflection.BindingFlags.Public |
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static;
+        var editorAssembly = typeof(EditorApplication).Assembly;
+        var menuUtils = editorAssembly.GetType("UnityEditor.MenuUtils", true);
+        var builder = menuUtils.GetMethods(flags).Single(method =>
+            method.Name == "AddCreateGameObjectItemsToMenu" && method.GetParameters().Length == 9);
+        var parameters = builder.GetParameters();
+        var originType = parameters[6].ParameterType;
+        var sceneType = parameters[5].ParameterType;
+        var parent = Selection.activeGameObject;
+        if (parent != null && (!IsObjectInContext(parent) || EditorUtility.IsPersistent(parent)))
+            parent = null;
+        UnityEngine.Object[] context = parent != null ? new UnityEngine.Object[] { parent } : null;
+        var scene = parent != null ? parent.scene : _dataScene;
+        if (!scene.IsValid() || !scene.isLoaded)
+            throw new System.InvalidOperationException("No loaded scene for object creation.");
+
+        var callback = new NativeCreateContext(this, tab, scene);
+        var callbackFlags = System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance;
+        var before = typeof(NativeCreateContext).GetMethod("Before", callbackFlags)
+            .MakeGenericMethod(originType, sceneType);
+        var after = typeof(NativeCreateContext).GetMethod("After", callbackFlags)
+            .MakeGenericMethod(originType, sceneType);
+        builder.Invoke(null, new object[] {
+            menu, context, true, true, false, scene.handle,
+            System.Enum.Parse(originType, parent != null ? "GameObject" : "Toolbar"),
+            System.Delegate.CreateDelegate(parameters[7].ParameterType, callback, before),
+            System.Delegate.CreateDelegate(parameters[8].ParameterType, callback, after)
+        });
+
+        // Packages can also contribute through the native Hierarchy hook.
+        var hooks = editorAssembly.GetType("UnityEditor.SceneManagement.SceneHierarchyHooks");
+        hooks?.GetMethod("AddCustomItemsToCreateMenu", flags)?.Invoke(null, new object[] { menu });
+    }
+
+    sealed class NativeCreateContext
+    {
+        readonly HierarchyOrganizerWindow owner;
+        readonly TabData tab;
+        readonly Scene scene;
+        HashSet<EntityId> existing;
+        System.Reflection.MethodInfo setTarget;
+        double focusReturnDeadline;
+        double nextFocusCheck;
+
+        public NativeCreateContext(HierarchyOrganizerWindow owner, TabData tab, Scene scene)
+        {
+            this.owner = owner;
+            this.tab = tab;
+            this.scene = scene;
+        }
+
+        public void Before<TOrigin, TScene>(string path, UnityEngine.Object[] context, TOrigin origin, TScene target)
+        {
+            existing = new HashSet<EntityId>(Resources.FindObjectsOfTypeAll<GameObject>()
+                .Select(go => go.GetEntityId()));
+            setTarget = typeof(EditorSceneManager).GetMethod("SetTargetSceneForNewGameObjects",
+                System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public |
+                System.Reflection.BindingFlags.NonPublic, null, new[] { typeof(TScene) }, null);
+            if (setTarget == null)
+                throw new System.MissingMethodException("SetTargetSceneForNewGameObjects");
+            setTarget.Invoke(null, new object[] { target });
+        }
+
+        public void After<TOrigin, TScene>(string path, UnityEngine.Object[] context, TOrigin origin, TScene target)
+        {
+setTarget.Invoke(null, new object[] { default(TScene) });
+            // Focus restoration must not depend on pinning or tab membership.
+            focusReturnDeadline = EditorApplication.timeSinceStartup + 1.25;
+            nextFocusCheck = EditorApplication.timeSinceStartup + 0.15;
+            EditorApplication.update -= RestoreOrganizerFocus;
+            EditorApplication.update += RestoreOrganizerFocus;
+            // Let the native command own parenting, component setup and Undo.
+            // Only expose newly selected objects in the tab that opened the menu.
+            if (owner == null || tab.locked || !owner._tabs.Contains(tab)) return;
+            bool isMain = IsHierarchyTab(tab);
+            foreach (var go in Selection.gameObjects)
+            {
+                if (go == null || go.scene != scene || existing == null || existing.Contains(go.GetEntityId())) continue;
+                var id = go.GetEntityId();
+                if (!isMain)
+                {
+                    owner.AutoNameEmptyTab(tab, go);
+                    if (!tab.pinnedIDs.Contains(id)) tab.pinnedIDs.Add(id);
+                }
+                for (var parent = go.transform.parent; parent != null; parent = parent.parent)
+                    owner._expanded.Add(parent.gameObject.GetEntityId());
+            }
+            owner.StateChanged();
+            owner.Repaint();
+        }
+
+        void RestoreOrganizerFocus()
+        {
+            double now = EditorApplication.timeSinceStartup;
+            if (owner == null || now >= focusReturnDeadline || EditorApplication.isCompiling)
+            {
+                EditorApplication.update -= RestoreOrganizerFocus;
+                return;
+            }
+            if (now < nextFocusCheck) return;
+            nextFocusCheck = now + 0.1;
+
+            var focused = EditorWindow.focusedWindow;
+            if (focused == owner) return;
+            // Creation may focus the Inspector or Scene View before the Hierarchy.
+            // Preserve a package's dedicated wizard instead of stealing its focus.
+            string focusedType = focused != null ? focused.GetType().FullName : null;
+            if (focused != null && focusedType != "UnityEditor.SceneHierarchyWindow" &&
+                focusedType != "UnityEditor.InspectorWindow" && !(focused is SceneView))
+            {
+                EditorApplication.update -= RestoreOrganizerFocus;
+                return;
+            }
+            // Show selects the dock tab; Focus alone can leave it behind another tab.
+            owner.Show();
+            owner.Focus();
+            owner.Repaint();
+            // Keep observing briefly: native framing/rename callbacks can focus
+            // the original Hierarchy again on a later editor update.
+        }
     }
 
     void RefreshMainView()
@@ -558,11 +805,10 @@ public class HierarchyOrganizerWindow : EditorWindow
             return;
         }
 
-        var main = _tabs.Find(t => string.Equals(t.name?.Trim(), "Main",
-            System.StringComparison.OrdinalIgnoreCase));
+        var main = _tabs.Find(IsHierarchyTab);
         if (main == null)
         {
-            main = new TabData { name = "Main", iconEmoji = "📁" };
+            main = new TabData { name = HierarchyTabName, iconEmoji = "📁" };
             _tabs.Insert(0, main);
         }
 
@@ -583,36 +829,75 @@ public class HierarchyOrganizerWindow : EditorWindow
         // Die Szenenansicht liest bei jedem Zeichnen die aktuellen Root-Objekte
         // und deren Kinder direkt aus der geöffneten Szene.
         StateChanged();
-        ShowNotification(new GUIContent("Main neu eingelesen: " + scene.name));
+        ShowNotification(new GUIContent("Hierarchie neu eingelesen: " + scene.name));
     }
 
     // ── Tab Bar ──────────────────────────────────
 
-    static string GetTabKindLabel(TabData tab)
+    static bool IsProjectTab(TabData tab)
     {
-        bool hasFolders = (tab.folderGuids?.Count ?? 0) > 0;
-        bool hasHierarchy = (tab.pinnedIDs?.Count ?? 0) > 0;
-        if (hasFolders) return hasHierarchy ? "Gemischt" : "Projekt";
-        return hasHierarchy || tab.viewMode != 1 ? "Hierarchie" : "Leer";
+        return tab != null && tab.tabKind == 1;
     }
 
-    static Rect[] CalculateTabLayout(float width, int tabCount, out float height)
+    static bool IsHierarchyTab(TabData tab)
     {
-        const float padding = 4f, gap = 3f, rowHeight = 48f, tabHeight = 44f;
+        if (tab == null || IsProjectTab(tab)) return false;
+        string name = tab.name?.Trim();
+        return string.Equals(name, HierarchyTabName, System.StringComparison.OrdinalIgnoreCase)
+            || string.Equals(name, LegacyMainTabName, System.StringComparison.OrdinalIgnoreCase);
+    }
+
+    bool CanAcceptTabDrop(TabData tab)
+    {
+        if (IsProjectTab(tab))
+            return DragAndDrop.objectReferences.Any(IsProjectFolder);
+        return DragAndDrop.objectReferences.Any(o =>
+            o is GameObject go && !EditorUtility.IsPersistent(go) && IsObjectInContext(go));
+    }
+
+    string GetTabDisplayName(TabData tab)
+    {
+        string prefix = string.IsNullOrEmpty(tab.iconEmoji) ? "" : tab.iconEmoji + " ";
+        return prefix + tab.name;
+    }
+
+    Rect[] CalculateTabLayout(float width, List<int> indices, bool projectTabs, out float height)
+    {
+        float padding = CompactLayout ? 3f : 4f;
+        float gap = CompactLayout ? 2f : 3f;
+        float rowHeight = projectTabs ? (CompactLayout ? 52f : 60f) : (CompactLayout ? 29f : 36f);
+        float tabHeight = projectTabs ? (CompactLayout ? 49f : 56f) : (CompactLayout ? 26f : 32f);
         float availableWidth = Mathf.Max(1f, width - padding * 2);
-        float tabWidth = Mathf.Min(140f, availableWidth);
-        var rects = new Rect[tabCount + 1]; // Der letzte Platz gehört dem Plus-Button.
+        var rects = new Rect[indices.Count + 1]; // Der letzte Platz gehört dem Plus-Button.
         float x = padding;
         float y = 2f;
-        for (int i = 0; i <= tabCount; i++)
+        for (int slot = 0; slot <= indices.Count; slot++)
         {
-            float itemWidth = i == tabCount ? Mathf.Min(30f, availableWidth) : tabWidth;
+            float itemWidth;
+            if (slot == indices.Count)
+            {
+                itemWidth = Mathf.Min(26f, availableWidth);
+            }
+            else
+            {
+                var tab = _tabs[indices[slot]];
+                string measuredText = tab.renaming ? tab.renameBuffer : GetTabDisplayName(tab);
+                float controlsWidth = 48f;
+                float measuredWidth = EditorStyles.label.CalcSize(new GUIContent(measuredText)).x + 12f + controlsWidth;
+                if (projectTabs)
+                {
+                    int subFolderCount = GetDirectProjectSubFolders(tab).Count;
+                    if (subFolderCount > 0)
+                        measuredWidth = Mathf.Max(measuredWidth, (subFolderCount + 1) * 21f + 6f);
+                }
+                itemWidth = Mathf.Clamp(measuredWidth, CompactLayout ? 56f : 64f, Mathf.Min(210f, availableWidth));
+            }
             if (x > padding && x + itemWidth > padding + availableWidth)
             {
                 x = padding;
                 y += rowHeight;
             }
-            rects[i] = new Rect(x, y, itemWidth, tabHeight);
+            rects[slot] = new Rect(x, y, itemWidth, tabHeight);
             x += itemWidth + gap;
         }
         height = y + tabHeight + 2f;
@@ -621,50 +906,172 @@ public class HierarchyOrganizerWindow : EditorWindow
 
     void DrawTabBar()
     {
-        int n = _tabs.Count;
-        var tabRects = CalculateTabLayout(position.width, n, out float barHeight);
+        DrawTabSection(true, T("PROJEKT-TABS", "PROJECT TABS"));
+        DrawTabSection(false, T("HIERARCHIE-TABS", "HIERARCHY TABS"));
+    }
+
+    sealed class ProjectSubFolder
+    {
+        public readonly string guid;
+        public readonly string path;
+        public readonly GUIContent content;
+
+        public ProjectSubFolder(string guid, string path, string label, string tooltip = null)
+        {
+            this.guid = guid ?? "";
+            this.path = path ?? "";
+            content = new GUIContent(label, tooltip ?? path);
+        }
+    }
+
+    List<ProjectSubFolder> GetDirectProjectSubFolders(TabData tab)
+    {
+        var result = new List<ProjectSubFolder>();
+        var seen = new HashSet<string>();
+        foreach (string masterGuid in tab.folderGuids ?? new List<string>())
+        {
+            string masterPath = AssetDatabase.GUIDToAssetPath(masterGuid);
+            if (!AssetDatabase.IsValidFolder(masterPath)) continue;
+            // Only categories located directly below a Prefabs folder become
+            // sub-tabs. If Prefabs itself was dropped, use it as the root.
+            IEnumerable<string> prefabRoots = string.Equals(System.IO.Path.GetFileName(masterPath), "Prefabs",
+                    System.StringComparison.OrdinalIgnoreCase)
+                ? new[] { masterPath }
+                : AssetDatabase.GetSubFolders(masterPath).Where(path =>
+                    string.Equals(System.IO.Path.GetFileName(path), "Prefabs",
+                        System.StringComparison.OrdinalIgnoreCase));
+            foreach (string prefabRoot in prefabRoots)
+            {
+                foreach (string childPath in AssetDatabase.GetSubFolders(prefabRoot))
+                {
+                    string guid = AssetDatabase.AssetPathToGUID(childPath);
+                    if (string.IsNullOrEmpty(guid) || !seen.Add(guid)) continue;
+                    string folderName = System.IO.Path.GetFileName(childPath);
+                    string shortLabel = string.IsNullOrEmpty(folderName)
+                        ? "?" : folderName.Substring(0, 1).ToUpperInvariant();
+                    result.Add(new ProjectSubFolder(guid, childPath, shortLabel,
+                        folderName + "\n" + childPath));
+                }
+            }
+        }
+        return result.OrderBy(folder => folder.content.text, System.StringComparer.OrdinalIgnoreCase).ToList();
+    }
+
+    void DrawProjectSubFolderTabs(TabData tab, int tabIndex, Rect groupRect)
+    {
+        var folders = GetDirectProjectSubFolders(tab);
+        if (folders.Count == 0)
+        {
+            tab.selectedProjectFolderGuid = "";
+            return;
+        }
+        if (!string.IsNullOrEmpty(tab.selectedProjectFolderGuid)
+            && !folders.Any(folder => folder.guid == tab.selectedProjectFolderGuid))
+            tab.selectedProjectFolderGuid = "";
+
+        const float gap = 1f;
+        float mainHeight = CompactLayout ? 26f : 32f;
+        Rect bar = new Rect(groupRect.x, groupRect.y + mainHeight + 2f, groupRect.width,
+            Mathf.Max(1f, groupRect.height - mainHeight - 2f));
+        EditorGUI.DrawRect(bar, new Color(ColTabBar.r, ColTabBar.g, ColTabBar.b, 0.98f));
+        Rect viewport = new Rect(bar.x + 3f, bar.y,
+            Mathf.Max(1f, bar.width - 6f), Mathf.Max(1f, bar.height));
+        var entries = new List<ProjectSubFolder>
+        {
+            new ProjectSubFolder("", "", "M",
+                T("Master – alle Prefab-Unterordner anzeigen", "Master – show all prefab subfolders"))
+        };
+        entries.AddRange(folders);
+        float[] widths = Enumerable.Repeat(20f, entries.Count).ToArray();
+        float contentWidth = widths.Sum() + gap * (widths.Length - 1);
+        float maxScroll = Mathf.Max(0f, contentWidth - viewport.width);
+        tab.projectSubTabScroll.x = Mathf.Clamp(tab.projectSubTabScroll.x, 0f, maxScroll);
+        if (Event.current.type == EventType.ScrollWheel && viewport.Contains(Event.current.mousePosition) && maxScroll > 0f)
+        {
+            tab.projectSubTabScroll.x = Mathf.Clamp(tab.projectSubTabScroll.x + Event.current.delta.y * 24f, 0f, maxScroll);
+            Event.current.Use();
+            Repaint();
+        }
+
+        GUI.BeginGroup(viewport);
+        float x = -tab.projectSubTabScroll.x;
+        for (int i = 0; i < entries.Count; i++)
+        {
+            ProjectSubFolder entry = entries[i];
+            bool active = tab.selectedProjectFolderGuid == entry.guid;
+            Color oldBackground = GUI.backgroundColor;
+            GUI.backgroundColor = active && tabIndex == _selectedTab ? new Color(0.78f, 0.78f, 0.78f)
+                : new Color(0.56f, 0.56f, 0.56f);
+            if (active)
+                GUI.Label(new Rect(x + 4f, -1f, 12f, 8f), new GUIContent("▼",
+                    T("Aktiver Unterordner", "Active subfolder")), EditorStyles.centeredGreyMiniLabel);
+            if (GUI.Button(new Rect(x, 6f, widths[i], 15f), entry.content, EditorStyles.miniButton))
+            {
+                _selectedTab = tabIndex;
+                tab.selectedProjectFolderGuid = entry.guid;
+                tab.scroll = Vector2.zero;
+                StateChanged();
+            }
+            GUI.backgroundColor = oldBackground;
+            x += widths[i] + gap;
+        }
+        GUI.EndGroup();
+        EditorGUI.DrawRect(new Rect(bar.x, bar.yMax - 1f, bar.width, 1f), ColSep);
+    }
+
+    void DrawTabSection(bool projectTabs, string heading)
+    {
+        var indices = Enumerable.Range(0, _tabs.Count)
+            .Where(i => IsProjectTab(_tabs[i]) == projectTabs).ToList();
+        int n = indices.Count;
+        var tabRects = CalculateTabLayout(position.width, indices, projectTabs, out float tabsHeight);
+        float headingHeight = CompactLayout ? 13f : 17f;
+        float barHeight = tabsHeight + headingHeight;
         var bar = GUILayoutUtility.GetRect(0, barHeight, GUILayout.ExpandWidth(true));
         EditorGUI.DrawRect(bar, ColTabBar);
+        GUI.Label(new Rect(bar.x + 5, bar.y, bar.width - 10, headingHeight), heading, EditorStyles.miniBoldLabel);
 
-        for (int i = 0; i < n; i++)
+        for (int slot = 0; slot < n; slot++)
         {
+            int i = indices[slot];
             var  tab      = _tabs[i];
             bool active   = i == _selectedTab;
             bool dragOver = _dragOverTab == i;
-            var  tRect    = tabRects[i];
-            tRect.position += bar.position;
+            var groupRect = tabRects[slot];
+            groupRect.position += bar.position;
+            groupRect.y += headingHeight;
+            var tRect = groupRect;
+            if (projectTabs) tRect.height = CompactLayout ? 26f : 32f;
             var  tabCol   = GetTabColor(tab);
 
             Color baseBg = active ? ColTabActive : ColTabBg;
             if (dragOver) baseBg = ColDragOver;
+            EditorGUI.DrawRect(tRect, baseBg);
 
-            if (tab.tabStyle == 1)
+            float topH = active ? 2.5f : 1.5f;
+            Color mutedTabCol = new Color(tabCol.r, tabCol.g, tabCol.b, active ? 0.82f : 0.38f);
+            EditorGUI.DrawRect(new Rect(tRect.x, tRect.y, tRect.width, topH), mutedTabCol);
+            if (projectTabs)
             {
-                Color tint = new Color(tabCol.r, tabCol.g, tabCol.b, active ? 0.32f : 0.16f);
-                EditorGUI.DrawRect(tRect, Color.Lerp(baseBg, tint, 0.6f));
+                float markerPulse = 0.5f + 0.5f *
+                    Mathf.Sin((float)EditorApplication.timeSinceStartup * Mathf.PI);
+                var markerStyle = new GUIStyle(EditorStyles.boldLabel)
+                {
+                    alignment = TextAnchor.MiddleCenter,
+                    fontSize = active ? 15 : 13
+                };
+                markerStyle.normal.textColor = active
+                    ? Color.Lerp(new Color(0.92f, 0.03f, 0.02f),
+                        new Color(1f, 0.90f, 0.78f), markerPulse)
+                    : new Color(0.78f, 0.78f, 0.78f, 0.82f);
+                GUI.Label(new Rect(tRect.x + 1f, tRect.y + 8f, 15f, 16f),
+                    new GUIContent(active ? "●" : "○", active
+                        ? T("Aktiver Projekt-Tab", "Active project tab")
+                        : T("Inaktiver Projekt-Tab", "Inactive project tab")),
+                    markerStyle);
             }
-            else
-            {
-                EditorGUI.DrawRect(tRect, baseBg);
-            }
-
-            if (tab.tabStyle == 2)
-            {
-                EditorGUI.DrawRect(new Rect(tRect.x + 6, tRect.y + (tRect.height - 8) / 2, 8, 8), tabCol);
-            }
-            else
-            {
-                float topH = active ? 3.5f : 2f;
-                EditorGUI.DrawRect(new Rect(tRect.x, tRect.y, tRect.width, topH), tabCol);
-
-                float barW = active ? 3.5f : 2f;
-                EditorGUI.DrawRect(new Rect(tRect.x, tRect.y + topH, barW, tRect.height - topH), tabCol);
-            }
-
-            if (active)
-            {
-                EditorGUI.DrawRect(new Rect(tRect.x, tRect.yMax - 1, tRect.width, 1), tabCol);
-            }
+            var cR = new Rect(tRect.xMax - 23, tRect.y + 7, 18, 18);
+            var lockR = new Rect(tRect.xMax - 44, tRect.y + 7, 18, 18);
 
             if (tab.renaming)
             {
@@ -691,37 +1098,24 @@ public class HierarchyOrganizerWindow : EditorWindow
                 {
                     GUI.SetNextControlName(ctrl);
                     tab.renameBuffer = GUI.TextField(
-                        new Rect(tRect.x + 6, tRect.y + 6, tRect.width - 24, tRect.height - 10),
+                        new Rect(tRect.x + 6, tRect.y + 6, tRect.width - 34, tRect.height - 10),
                         tab.renameBuffer, EditorStyles.miniTextField);
                     if (GUI.GetNameOfFocusedControl() != ctrl) GUI.FocusControl(ctrl);
                 }
             }
             else
             {
-                if (tab.locked)
-                {
-                    var lc = GUI.color; GUI.color = ColLocked;
-                    GUI.Label(new Rect(tRect.xMax - 32, tRect.y + 4, 14, tRect.height), "🔒", EditorStyles.miniLabel);
-                    GUI.color = lc;
-                }
+                string displayName = GetTabDisplayName(tab);
 
-                string prefix = string.IsNullOrEmpty(tab.iconEmoji) ? "" : tab.iconEmoji + " ";
-                string displayName = prefix + tab.name;
-                if (tab.pinnedIDs.Count + (tab.folderGuids?.Count ?? 0) > 0)
-                    displayName += "  +" + (tab.pinnedIDs.Count + (tab.folderGuids?.Count ?? 0));
-
-                float textX = (tab.tabStyle == 2) ? tRect.x + 18 : tRect.x + 8;
-                string kind = GetTabKindLabel(tab);
-                string tooltip = kind + "-Tab: " + tab.name + "\n"
-                    + (tab.folderGuids?.Count ?? 0) + " Projektordner, "
-                    + tab.pinnedIDs.Count + " Hierarchieobjekte";
-                float textWidth = Mathf.Max(1f, tRect.xMax - textX - (tab.locked ? 34f : 18f));
-                GUI.Label(new Rect(textX, tRect.y + 4, textWidth, 15),
-                    new GUIContent(kind, tooltip), EditorStyles.miniLabel);
-                GUI.Label(new Rect(textX, tRect.y + 19, textWidth, 21),
+                float textX = tRect.x + (projectTabs ? 16f : 8f);
+                string tooltip = tab.name + "\n" + (tab.folderGuids?.Count ?? 0) + T(" Projektordner, ", " project folders, ")
+                    + tab.pinnedIDs.Count + T(" Hierarchieobjekte", " hierarchy objects");
+                float textWidth = Mathf.Max(1f, tRect.xMax - textX - 48f);
+                GUI.Label(new Rect(textX, tRect.y + 3, textWidth, tRect.height - 4),
                     new GUIContent(displayName, tooltip), active ? (_stTabActive ?? EditorStyles.boldLabel) : (_stTabNormal ?? EditorStyles.label));
 
-                if (Event.current.type == EventType.MouseDown && tRect.Contains(Event.current.mousePosition))
+                if (Event.current.type == EventType.MouseDown && tRect.Contains(Event.current.mousePosition)
+                    && !lockR.Contains(Event.current.mousePosition) && !cR.Contains(Event.current.mousePosition))
                 {
                     if (Event.current.button == 1)
                     {
@@ -734,7 +1128,10 @@ public class HierarchyOrganizerWindow : EditorWindow
                     }
                     else
                     {
+                        _lastClickedObjectID = default;
+                        _lastClickedObjectTime = -1;
                         _selectedTab = i;
+                        if (IsProjectTab(tab)) tab.selectedProjectFolderGuid = "";
                         _dragSourceTab = i;
                     }
                     Event.current.Use();
@@ -742,27 +1139,50 @@ public class HierarchyOrganizerWindow : EditorWindow
                 }
             }
 
-            var cR = new Rect(tRect.xMax - 16, tRect.y + 7, 12, 12);
-            var oc = GUI.color; GUI.color = new Color(1, 1, 1, 0.65f);
-            if (GUI.Button(cR, "×", EditorStyles.miniLabel))
+            var lockColor = GUI.color;
+            GUI.color = tab.locked ? ColLocked : new Color(1f, 1f, 1f, 0.55f);
+            if (GUI.Button(lockR, new GUIContent(tab.locked ? "🔒" : "🔓",
+                    tab.locked ? T("Tab entsperren", "Unlock tab") : T("Tab sperren", "Lock tab")), EditorStyles.miniButton))
+            {
+                tab.locked = !tab.locked;
+                StateChanged();
+            }
+            GUI.color = lockColor;
+
+            bool closeHovered = cR.Contains(Event.current.mousePosition);
+            var oc = GUI.color;
+            var ob = GUI.backgroundColor;
+            GUI.color = closeHovered ? Color.white : new Color(1f, 1f, 1f, 0.62f);
+            GUI.backgroundColor = closeHovered ? new Color(0.92f, 0.30f, 0.30f) : new Color(0.34f, 0.34f, 0.34f);
+            if (GUI.Button(cR, new GUIContent("×", T("Tab löschen", "Delete tab")), EditorStyles.miniButton))
             {
                 RemoveTab(i);
                 return;
             }
             GUI.color = oc;
+            GUI.backgroundColor = ob;
 
             HandleTabDragDrop(i, tRect, tab);
+            if (projectTabs) DrawProjectSubFolderTabs(tab, i, groupRect);
 
         }
 
         var addR = tabRects[n];
         addR.position += bar.position;
-        EditorGUI.DrawRect(addR, ColTabHover);
-        var oldColor = GUI.color; GUI.color = Color.white;
-        if (GUI.Button(addR, "+", EditorStyles.boldLabel))
-            AddTab();
+        addR.y += headingHeight;
+        var plusR = new Rect(addR.x, addR.y + 2, 26, Mathf.Min(26, addR.height - 2));
+        bool dropHover = plusR.Contains(Event.current.mousePosition) && CanAcceptNewAutoTabDrop(projectTabs);
+        HandleNewAutoTabDrop(plusR, projectTabs);
+        var oldColor = GUI.color;
+        var oldBackground = GUI.backgroundColor;
+        GUI.color = new Color(1f, 1f, 1f, 0.82f);
+        if (dropHover) GUI.backgroundColor = ColDragOver;
+        if (GUI.Button(plusR, new GUIContent("+", T(
+                projectTabs ? "Neuen Projekt-Tab hinzufügen oder Ordner hier ablegen" : "Neuen Hierarchie-Tab hinzufügen oder Objekt hier ablegen",
+                projectTabs ? "Add a project tab or drop a folder here" : "Add a hierarchy tab or drop an object here")), EditorStyles.miniButton))
+            AddTab(projectTabs);
         GUI.color = oldColor;
-        HandleNewFolderTabDrop(addR);
+        GUI.backgroundColor = oldBackground;
 
         EditorGUI.DrawRect(new Rect(bar.x, bar.yMax, bar.width, 1), ColSep);
 
@@ -779,7 +1199,7 @@ public class HierarchyOrganizerWindow : EditorWindow
     {
         if (!_autoNameTabs || tab == null || firstObject == null || tab.locked || tab.pinnedIDs.Count > 0 || (tab.folderGuids?.Count ?? 0) > 0)
             return;
-        if (string.Equals(tab.name?.Trim(), "Main", System.StringComparison.OrdinalIgnoreCase))
+        if (IsHierarchyTab(tab))
             return;
 
         tab.name = GetUniqueTabName(firstObject.name, tab);
@@ -794,7 +1214,7 @@ public class HierarchyOrganizerWindow : EditorWindow
         {
             if (ev == EventType.DragUpdated)
             {
-                bool hasGo = DragAndDrop.objectReferences.Any(o => (o is GameObject go && IsObjectInContext(go)) || IsProjectFolder(o));
+                bool hasGo = CanAcceptTabDrop(tab);
                 DragAndDrop.visualMode = hasGo ? DragAndDropVisualMode.Copy : DragAndDropVisualMode.Rejected;
                 _dragOverTab = hasGo ? tabIndex : -1;
                 Event.current.Use();
@@ -802,17 +1222,20 @@ public class HierarchyOrganizerWindow : EditorWindow
             }
             else if (ev == EventType.DragPerform)
             {
+                if (!CanAcceptTabDrop(tab)) return;
                 DragAndDrop.AcceptDrag();
-                int added = AddDroppedFolders(tab);
+                int added = IsProjectTab(tab) ? AddDroppedFolders(tab) : 0;
                 foreach (var obj in DragAndDrop.objectReferences)
                 {
-                    if (obj is GameObject go && IsObjectInContext(go))
+                    if (!IsProjectTab(tab) && obj is GameObject go &&
+                        !EditorUtility.IsPersistent(go) && IsObjectInContext(go))
                     {
                         EntityId id = go.GetEntityId();
                         if (!tab.pinnedIDs.Contains(id))
                         {
                             AutoNameEmptyTab(tab, go);
                             tab.pinnedIDs.Add(id);
+                            _expanded.Add(id);
                             added++;
                         }
                     }
@@ -846,30 +1269,6 @@ public class HierarchyOrganizerWindow : EditorWindow
         var tab  = _tabs[idx];
         var menu = new GenericMenu();
 
-        menu.AddItem(new GUIContent("🎨 Farbe & Stil anpassen..."), false, () =>
-        {
-            TabColorPickerPopup.ShowWindow(this, tab);
-        });
-        menu.AddSeparator("");
-
-        for (int c = 0; c < PresetColors.Length; c++)
-        {
-            int ci = c;
-            menu.AddItem(new GUIContent("Farbe/" + PresetColors[c].name),
-                string.IsNullOrEmpty(tab.customHexColor) && tab.colorIndex == ci, () =>
-                {
-                    tab.colorIndex = ci;
-                    tab.customHexColor = "";
-                    StateChanged();
-                });
-        }
-        menu.AddSeparator("Farbe/");
-        menu.AddItem(new GUIContent("Farbe/🎨 Eigene Farbe wählen..."), false, () => TabColorPickerPopup.ShowWindow(this, tab));
-
-        menu.AddItem(new GUIContent("Tab-Stil/Akzentlinie oben"), tab.tabStyle == 0, () => { tab.tabStyle = 0; StateChanged(); });
-        menu.AddItem(new GUIContent("Tab-Stil/Volle Tönung"),    tab.tabStyle == 1, () => { tab.tabStyle = 1; StateChanged(); });
-        menu.AddItem(new GUIContent("Tab-Stil/Pille mit Punkt"), tab.tabStyle == 2, () => { tab.tabStyle = 2; StateChanged(); });
-
         string[] sampleEmojis = { "📁 Ordner", "🏠 Main", "🎮 Gameplay", "🖼️ GUI/UI", "💡 Beleuchtung", "🔊 Audio", "🤖 KI/Enemies", "🎬 Kamera/Cutscene", "📦 Props/Assets", "⚙️ Setup", "🚩 Spawns", "💎 Collectibles", "✨ Effekte" };
         foreach (var se in sampleEmojis)
         {
@@ -881,24 +1280,23 @@ public class HierarchyOrganizerWindow : EditorWindow
         menu.AddSeparator("");
 
         if (idx > 0)
-            menu.AddItem(new GUIContent("Nach links verschieben"), false, () => MoveTab(idx, -1));
+            menu.AddItem(new GUIContent(T("Nach links verschieben", "Move left")), false, () => MoveTab(idx, -1));
         else
-            menu.AddDisabledItem(new GUIContent("Nach links verschieben"));
+            menu.AddDisabledItem(new GUIContent(T("Nach links verschieben", "Move left")));
 
         if (idx < _tabs.Count - 1)
-            menu.AddItem(new GUIContent("Nach rechts verschieben"), false, () => MoveTab(idx, 1));
+            menu.AddItem(new GUIContent(T("Nach rechts verschieben", "Move right")), false, () => MoveTab(idx, 1));
         else
-            menu.AddDisabledItem(new GUIContent("Nach rechts verschieben"));
+            menu.AddDisabledItem(new GUIContent(T("Nach rechts verschieben", "Move right")));
 
-        menu.AddItem(new GUIContent("Tab duplizieren"), false, () => DuplicateTab(idx));
-
-        menu.AddSeparator("");
-        menu.AddItem(new GUIContent("Umbenennen"), false, () => { tab.renaming = true; tab.renameBuffer = tab.name; StateChanged(); });
-        menu.AddItem(new GUIContent(tab.locked ? "Entsperren" : "Sperren"), false, () => { tab.locked = !tab.locked; StateChanged(); });
-        menu.AddItem(new GUIContent(tab.showNotes ? "Notiz verbergen" : "Notiz anzeigen"), false, () => { tab.showNotes = !tab.showNotes; StateChanged(); });
+        menu.AddItem(new GUIContent(T("Tab duplizieren", "Duplicate tab")), false, () => DuplicateTab(idx));
 
         menu.AddSeparator("");
-        menu.AddItem(new GUIContent("Tab leeren (alle Pins entfernen)"), false, () =>
+        menu.AddItem(new GUIContent(T("Umbenennen", "Rename")), false, () => { tab.renaming = true; tab.renameBuffer = tab.name; StateChanged(); });
+        menu.AddItem(new GUIContent(tab.locked ? T("Entsperren", "Unlock") : T("Sperren", "Lock")), false, () => { tab.locked = !tab.locked; StateChanged(); });
+
+        menu.AddSeparator("");
+        menu.AddItem(new GUIContent(T("Tab leeren (alle Pins entfernen)", "Clear tab (remove all pins)")), false, () =>
         {
             if (tab.pinnedIDs.Count == 0) return;
             if (EditorUtility.DisplayDialog("Tab leeren?", $"Alle {tab.pinnedIDs.Count} angehefteten Objekte aus '{tab.name}' entfernen?", "Ja, leeren", "Abbrechen"))
@@ -907,7 +1305,7 @@ public class HierarchyOrganizerWindow : EditorWindow
                 StateChanged();
             }
         });
-        menu.AddItem(new GUIContent("Tab löschen"), false, () => RemoveTab(idx));
+        menu.AddItem(new GUIContent(T("Tab löschen", "Delete tab")), false, () => RemoveTab(idx));
 
         menu.ShowAsContext();
     }
@@ -938,11 +1336,15 @@ public class HierarchyOrganizerWindow : EditorWindow
             customHexColor = src.customHexColor,
             iconEmoji      = src.iconEmoji,
             tabStyle       = src.tabStyle,
+            tabKind        = src.tabKind,
             notes          = src.notes,
             showNotes      = src.showNotes,
             pinnedIDs      = new List<EntityId>(src.pinnedIDs),
+            folderNames    = new List<string>(src.folderNames ?? new List<string>()),
+            showFolderNames = src.showFolderNames,
             folderGuids = new List<string>(src.folderGuids ?? new List<string>()),
-            history        = new List<HistoryEntry>(src.history)
+            selectedProjectFolderGuid = src.selectedProjectFolderGuid,
+            projectSubTabScroll = src.projectSubTabScroll
         };
         _tabs.Insert(index + 1, clone);
         _selectedTab = index + 1;
@@ -983,6 +1385,29 @@ public class HierarchyOrganizerWindow : EditorWindow
         EditorGUILayout.EndHorizontal();
     }
 
+    void EnsureFilterOptions()
+    {
+        if (_tagFilterOptions != null && _layerFilterOptions != null && _layerFilterValues != null)
+            return;
+
+        string[] editorTags = UnityEditorInternal.InternalEditorUtility.tags ?? new string[0];
+        _tagFilterOptions = new string[editorTags.Length + 1];
+        _tagFilterOptions[0] = "(alle)";
+        System.Array.Copy(editorTags, 0, _tagFilterOptions, 1, editorTags.Length);
+
+        var layerNames = new List<string> { "(alle)" };
+        var layerValues = new List<int> { -1 };
+        for (int layer = 0; layer < 32; layer++)
+        {
+            string layerName = LayerMask.LayerToName(layer);
+            if (string.IsNullOrEmpty(layerName)) continue;
+            layerNames.Add(layerName);
+            layerValues.Add(layer);
+        }
+        _layerFilterOptions = layerNames.ToArray();
+        _layerFilterValues = layerValues.ToArray();
+    }
+
     void DrawFilterBar(TabData tab)
     {
         EditorGUILayout.BeginHorizontal(GUILayout.Height(22));
@@ -990,26 +1415,21 @@ public class HierarchyOrganizerWindow : EditorWindow
 
         try
         {
-            GUILayout.Label("Tag:", EditorStyles.miniLabel, GUILayout.Width(28));
-            string[] allTags = UnityEditorInternal.InternalEditorUtility.tags ?? new string[0];
-            string[] tags    = new[] { "(alle)" }.Concat(allTags).ToArray();
-            int      tagIdx  = Mathf.Max(0, System.Array.IndexOf(tags, tab.tagFilter));
-            int      newTag  = EditorGUILayout.Popup(tagIdx, tags, EditorStyles.toolbarPopup, GUILayout.Width(80));
-            tab.tagFilter    = newTag == 0 ? "" : tags[newTag];
+            EnsureFilterOptions();
 
-            GUILayout.Space(8);
+            GUILayout.Label(CompactLayout ? "T" : "Tag:", EditorStyles.miniLabel, GUILayout.Width(CompactLayout ? 12f : 28f));
+            int tagIdx = Mathf.Max(0, System.Array.IndexOf(_tagFilterOptions, tab.tagFilter));
+            int newTag = EditorGUILayout.Popup(tagIdx, _tagFilterOptions, EditorStyles.toolbarPopup, GUILayout.Width(CompactLayout ? 70f : 80f));
+            tab.tagFilter = newTag == 0 ? "" : _tagFilterOptions[newTag];
 
-            GUILayout.Label("Layer:", EditorStyles.miniLabel, GUILayout.Width(38));
-            var layerNames = new List<string> { "(alle)" };
-            for (int l = 0; l < 32; l++)
-            {
-                string ln = LayerMask.LayerToName(l);
-                if (!string.IsNullOrEmpty(ln)) layerNames.Add(ln);
-            }
-            string[] layers   = layerNames.ToArray();
-            int      layerIdx = tab.layerFilter < 0 ? 0 : Mathf.Clamp(tab.layerFilter + 1, 0, layers.Length - 1);
-            int      newLayer = EditorGUILayout.Popup(layerIdx, layers, EditorStyles.toolbarPopup, GUILayout.Width(80));
-            tab.layerFilter   = newLayer == 0 ? -1 : newLayer - 1;
+            GUILayout.Space(CompactLayout ? 3f : 8f);
+
+            GUILayout.Label(CompactLayout ? "L" : "Layer:", EditorStyles.miniLabel, GUILayout.Width(CompactLayout ? 12f : 38f));
+            int layerIdx = System.Array.IndexOf(_layerFilterValues, tab.layerFilter);
+            if (layerIdx < 0) layerIdx = 0;
+            int newLayer = EditorGUILayout.Popup(layerIdx, _layerFilterOptions, EditorStyles.toolbarPopup, GUILayout.Width(CompactLayout ? 70f : 80f));
+            tab.layerFilter = _layerFilterValues[Mathf.Clamp(newLayer, 0, _layerFilterValues.Length - 1)];
+
         }
         catch
         {
@@ -1021,32 +1441,89 @@ public class HierarchyOrganizerWindow : EditorWindow
         EditorGUILayout.EndHorizontal();
     }
 
+    void ActivateMainTab()
+    {
+        int mainIndex = _tabs.FindIndex(IsHierarchyTab);
+        if (mainIndex < 0)
+        {
+            ShowNotification(new GUIContent(T("Kein Tab namens Hierarchie gefunden.", "No Hierarchy tab was found.")));
+            return;
+        }
+
+        _selectedTab = mainIndex;
+        _sceneColorFilterTab = null;
+        _activeSceneColorGroup = null;
+        StateChanged();
+        Repaint();
+    }
+
     // ── Schnellfilter-Chips (1-Klick Filter) ───────
 
     void DrawQuickFilterChips(TabData tab)
     {
+        float mainButtonWidth = CompactLayout ? 40f : 55f;
+        // Extra Reserve berücksichtigt GUILayout-Ränder und unterschiedliche Emoji-Breiten
+        // der Unity-Skins. Der Pfeil erscheint dadurch, bevor das erste Symbol verschwindet.
+        float availableForFilters = Mathf.Max(30f, position.width - 6f - 28f - 8f - mainButtonWidth - 7f - 70f);
+        bool hasOverflow = GetQuickFilterRequiredWidth() > availableForFilters;
+        if (!hasOverflow) _quickFiltersExpanded = false;
+
         EditorGUILayout.BeginHorizontal(GUILayout.Height(24));
         GUILayout.Space(6);
+
+        var oldColor = GUI.color;
+        GUI.color = _showQuickFilterLabels ? new Color(0.40f, 0.90f, 1f) : new Color(0.72f, 0.72f, 0.72f);
+        if (GUILayout.Button(new GUIContent("Aa", _showQuickFilterLabels
+                ? "Filter-Bezeichnungen ausblenden – die Tooltips bleiben erhalten."
+                : "Filter-Bezeichnungen einblenden."),
+            EditorStyles.miniButton, GUILayout.Width(28), GUILayout.Height(20)))
+            _showQuickFilterLabels = !_showQuickFilterLabels;
+        GUI.color = oldColor;
+        GUILayout.Space(8f);
+
+        if (GUILayout.Button(new GUIContent(CompactLayout ? "Hier." : T("Zu Hierarchie", "Go to Hierarchy"),
+                T("Zum Tab Hierarchie wechseln.", "Switch to the Hierarchy tab.")), EditorStyles.miniButton,
+            GUILayout.Width(mainButtonWidth), GUILayout.Height(20f)))
+            ActivateMainTab();
+
+        GUILayout.Space(7f);
+
+        if (hasOverflow)
+        {
+            var arrowColor = GUI.color;
+            GUI.color = new Color(0.45f, 0.90f, 1f);
+            if (GUILayout.Button(new GUIContent(CompactLayout
+                        ? (_quickFiltersExpanded ? "▲" : "▼")
+                        : (_quickFiltersExpanded ? "▲ Filter" : "▼ Filter"),
+                    T(_quickFiltersExpanded ? "Filter einklappen" : "Alle Filter nach unten aufklappen",
+                      _quickFiltersExpanded ? "Collapse filters" : "Expand all filters below")),
+                EditorStyles.miniButton, GUILayout.Width(CompactLayout ? 26f : 58f), GUILayout.Height(20f)))
+            {
+                _quickFiltersExpanded = !_quickFiltersExpanded;
+                _quickFilterScroll = Vector2.zero;
+            }
+            GUI.color = arrowColor;
+            GUILayout.Space(3f);
+        }
+
+        if (_quickFiltersExpanded)
+        {
+            GUILayout.FlexibleSpace();
+            EditorGUILayout.EndHorizontal();
+            DrawExpandedQuickFilters(tab);
+            return;
+        }
 
         _quickFilterScroll = EditorGUILayout.BeginScrollView(_quickFilterScroll, GUIStyle.none, GUIStyle.none, GUILayout.Height(26));
         EditorGUILayout.BeginHorizontal();
 
-        DrawChip(tab, "", "Alle");
-        DrawChip(tab, "lights", "💡 Lights");
-        DrawChip(tab, "triggers", "⚡ Triggers (GC2)");
-        DrawChip(tab, "actions", "🎬 Actions (GC2)");
-        DrawChip(tab, "character", "👤 Character / Player");
-        DrawChip(tab, "variables", "📊 Variables (GC2)");
-        DrawChip(tab, "cameras", "🎥 Kameras / Shots");
-        DrawChip(tab, "ui", "🖼️ UI");
-        DrawChip(tab, "colliders", "🔲 Collider");
-        DrawChip(tab, "physics", "⚖️ Physics / RB");
-        DrawChip(tab, "navmesh", "🏃 NavMesh");
-        DrawChip(tab, "audio", "🔊 Audio");
-        DrawChip(tab, "vfx", "💥 VFX");
-        DrawChip(tab, "missing", "⚠️ Missing");
-        DrawChip(tab, "favorites", "⭐ Favs");
-        DrawChip(tab, "inactive", "👁️ Inaktiv");
+        DrawChip(tab, QuickFilterOptions[0]);
+        DrawQuickFilterGroupLabel("GC2", "Filter für Game Creator 2.");
+        for (int i = 1; i <= 4; i++)
+            DrawChip(tab, QuickFilterOptions[i]);
+        DrawQuickFilterGroupLabel("UNITY", "Filter für Unity-Komponenten und allgemeine Objektzustände.");
+        for (int i = 5; i < QuickFilterOptions.Length; i++)
+            DrawChip(tab, QuickFilterOptions[i]);
 
         EditorGUILayout.EndHorizontal();
         EditorGUILayout.EndScrollView();
@@ -1055,23 +1532,138 @@ public class HierarchyOrganizerWindow : EditorWindow
         EditorGUILayout.EndHorizontal();
     }
 
-    void DrawChip(TabData tab, string key, string label)
+    float GetQuickFilterRequiredWidth()
     {
-        bool active = tab.quickFilter == key;
+        float width = 3f + 1f + 27f + 3f + 1f + 36f;
+        for (int i = 0; i < QuickFilterOptions.Length; i++)
+            width += GetQuickFilterWidth(QuickFilterOptions[i]) + 2f;
+        return width;
+    }
+
+    float GetQuickFilterWidth(QuickFilterOption option)
+    {
+        if (!_showQuickFilterLabels) return 28f;
+        var style = _stFilterChip ?? EditorStyles.miniButtonMid;
+        return Mathf.Max(28f, Mathf.Ceil(style.CalcSize(GetQuickFilterContent(option)).x) + 10f);
+    }
+
+    void DrawExpandedQuickFilters(TabData tab)
+    {
+        float available = Mathf.Max(80f, position.width - 12f);
+        float x = 0f, y = 0f;
+        const float rowHeight = 22f, gap = 3f;
+        var rects = new List<Rect>();
+        var options = new List<QuickFilterOption>();
+        var labels = new List<string>();
+
+        System.Action<QuickFilterOption> addOption = option =>
+        {
+            float width = GetQuickFilterWidth(option);
+            if (x > 0f && x + width > available) { x = 0f; y += rowHeight + gap; }
+            rects.Add(new Rect(x, y, width, rowHeight)); options.Add(option); labels.Add(null);
+            x += width + gap;
+        };
+        System.Action<string> addLabel = label =>
+        {
+            float width = label == "GC2" ? 36f : 48f;
+            if (x > 0f && x + width > available) { x = 0f; y += rowHeight + gap; }
+            rects.Add(new Rect(x, y, width, rowHeight)); options.Add(null); labels.Add(label);
+            x += width + gap;
+        };
+
+        addOption(QuickFilterOptions[0]);
+        addLabel("GC2");
+        for (int i = 1; i <= 4; i++) addOption(QuickFilterOptions[i]);
+        addLabel("UNITY");
+        for (int i = 5; i < QuickFilterOptions.Length; i++) addOption(QuickFilterOptions[i]);
+
+        Rect area = GUILayoutUtility.GetRect(0f, y + rowHeight + 3f, GUILayout.ExpandWidth(true));
+        for (int i = 0; i < rects.Count; i++)
+        {
+            Rect rect = rects[i]; rect.position += new Vector2(area.x + 6f, area.y);
+            if (options[i] != null) DrawChipAt(rect, tab, options[i]);
+            else
+            {
+                EditorGUI.DrawRect(new Rect(rect.x, rect.y + 3f, 1f, rect.height - 6f), new Color(1f, 1f, 1f, 0.18f));
+                GUI.Label(new Rect(rect.x + 4f, rect.y, rect.width - 4f, rect.height), labels[i], EditorStyles.centeredGreyMiniLabel);
+            }
+        }
+    }
+
+    void DrawQuickFilterGroupLabel(string label, string tooltip)
+    {
+        GUILayout.Space(3f);
+        Rect separator = GUILayoutUtility.GetRect(1f, 16f, GUILayout.Width(1f), GUILayout.Height(16f));
+        if (Event.current.type == EventType.Repaint)
+            EditorGUI.DrawRect(separator, new Color(1f, 1f, 1f, 0.18f));
+        GUILayout.Label(new GUIContent(label, tooltip), EditorStyles.centeredGreyMiniLabel,
+            GUILayout.Width(label == "GC2" ? 27f : 36f), GUILayout.Height(20f));
+    }
+
+    void DrawChip(TabData tab, QuickFilterOption option)
+    {
+        bool active = tab.quickFilter == option.key;
         var style   = (active ? _stFilterChipActive : _stFilterChip) ?? EditorStyles.miniButtonMid;
         var tabCol  = GetTabColor(tab);
+        GUIContent content = GetQuickFilterContent(option);
 
         var oldBg = GUI.backgroundColor;
         if (active) GUI.backgroundColor = tabCol;
 
-        if (GUILayout.Button(label, style))
+        bool clicked = _showQuickFilterLabels
+            ? GUILayout.Button(content, style)
+            : GUILayout.Button(content, style, GUILayout.Width(28));
+        if (clicked)
         {
-            tab.quickFilter = (active && key != "") ? "" : key;
+            tab.quickFilter = (active && option.key != "") ? "" : option.key;
         }
         GUI.backgroundColor = oldBg;
     }
 
-    // ── Tab-Farben: unsichtbare Mitgliedschaft, sichtbarer Suchfilter ──
+    void DrawChipAt(Rect rect, TabData tab, QuickFilterOption option)
+    {
+        bool active = tab.quickFilter == option.key;
+        var style = (active ? _stFilterChipActive : _stFilterChip) ?? EditorStyles.miniButtonMid;
+        var oldBg = GUI.backgroundColor;
+        if (active) GUI.backgroundColor = GetTabColor(tab);
+        if (GUI.Button(rect, GetQuickFilterContent(option), style))
+            tab.quickFilter = (active && option.key != "") ? "" : option.key;
+        GUI.backgroundColor = oldBg;
+    }
+
+    GUIContent GetQuickFilterContent(QuickFilterOption option)
+    {
+        if (!_englishUI) return _showQuickFilterLabels ? option.labeledContent : option.compactContent;
+        string label = EnglishQuickFilterLabel(option.key);
+        return new GUIContent(option.compactContent.text + (_showQuickFilterLabels ? " " + label : ""),
+            "Show " + label.ToLowerInvariant() + " objects.");
+    }
+
+    static string EnglishQuickFilterLabel(string key)
+    {
+        switch (key)
+        {
+            case "": return "All";
+            case "lights": return "Lights";
+            case "triggers": return "Triggers";
+            case "actions": return "Actions";
+            case "character": return "Characters";
+            case "variables": return "Variables";
+            case "cameras": return "Cameras";
+            case "ui": return "UI";
+            case "colliders": return "Colliders";
+            case "physics": return "Physics";
+            case "navmesh": return "NavMesh";
+            case "audio": return "Audio";
+            case "vfx": return "VFX";
+            case "missing": return "Missing";
+            case "favorites": return "Favorites";
+            case "inactive": return "Inactive";
+            default: return key;
+        }
+    }
+
+    // ── Tab-Filter: jedes Hierarchie-Tab ist ein eigener Filter ──
 
     void RebuildTabColorGroups()
     {
@@ -1079,16 +1671,12 @@ public class HierarchyOrganizerWindow : EditorWindow
         if (_sceneColorFilterTab != null && !_tabs.Contains(_sceneColorFilterTab))
             _sceneColorFilterTab = null;
 
-        foreach (var sourceTab in _tabs)
+        for (int i = 0; i < _tabs.Count; i++)
         {
-            Color color = GetTabColor(sourceTab);
-            string key = ColorUtility.ToHtmlStringRGB(color);
-            var group = _tabColorGroups.Find(g => g.key == key);
-            if (group == null)
-            {
-                group = new TabColorGroup { key = key, color = color };
-                _tabColorGroups.Add(group);
-            }
+            var sourceTab = _tabs[i];
+            if (IsProjectTab(sourceTab)) continue;
+            var group = new TabColorGroup { key = i.ToString(), color = GetTabColor(sourceTab) };
+            _tabColorGroups.Add(group);
             group.tabs.Add(sourceTab);
             if (sourceTab.pinnedIDs != null)
                 group.pinnedIDs.UnionWith(sourceTab.pinnedIDs);
@@ -1096,18 +1684,23 @@ public class HierarchyOrganizerWindow : EditorWindow
 
         _activeSceneColorGroup = _sceneColorFilterTab == null ? null
             : _tabColorGroups.Find(g => g.tabs.Contains(_sceneColorFilterTab));
+        _tabColorGroupsVersion = _stateVersion;
     }
 
     void DrawTabColorFilterBar(TabData viewTab)
     {
-        RebuildTabColorGroups();
+        if (_tabColorGroupsVersion != _stateVersion)
+            RebuildTabColorGroups();
+        else
+            _activeSceneColorGroup = _sceneColorFilterTab == null ? null
+                : _tabColorGroups.Find(g => g.tabs.Contains(_sceneColorFilterTab));
 
         EditorGUILayout.BeginHorizontal();
         GUILayout.Space(6);
-        GUILayout.Label(new GUIContent("Tab-Farben", "Objekte anhand ihrer Tab-Zuordnung finden. Unterobjekte gehören dazu."),
+        GUILayout.Label(new GUIContent("Tab-Filter", "Objekte eines bestimmten Hierarchie-Tabs anzeigen. Unterobjekte gehören dazu."),
             EditorStyles.miniBoldLabel);
         GUILayout.FlexibleSpace();
-        if (GUILayout.Button(new GUIContent("Alle Farben", "Farbfilter aufheben; andere Suchfilter bleiben erhalten."),
+        if (GUILayout.Button(new GUIContent("Alle Tabs", "Tab-Filter aufheben; andere Suchfilter bleiben erhalten."),
             _activeSceneColorGroup == null ? EditorStyles.miniButtonMid : EditorStyles.miniButton,
             GUILayout.Width(82)))
         {
@@ -1135,12 +1728,12 @@ public class HierarchyOrganizerWindow : EditorWindow
         float x = 0f, y = 0f, rowHeight = 0f;
         for (int i = 0; i < _tabColorGroups.Count; i++)
         {
-            var content = new GUIContent(string.Join(", ", _tabColorGroups[i].tabs.Select(t => t.name)));
+            var content = new GUIContent(_tabColorGroups[i].tabs[0].name);
             filterLabels[i] = content;
             float width = Mathf.Min(availableWidth, Mathf.Max(75f,
-                Mathf.Ceil(labelStyle.CalcSize(content).x) + 40f));
+                Mathf.Ceil(labelStyle.CalcSize(content).x) + 18f));
             float height = Mathf.Max(24f,
-                Mathf.Ceil(labelStyle.CalcHeight(content, width - 38f)) + 8f);
+                Mathf.Ceil(labelStyle.CalcHeight(content, width - 12f)) + 8f);
             if (x > 0f && x + width > availableWidth)
             {
                 x = 0f;
@@ -1160,10 +1753,11 @@ public class HierarchyOrganizerWindow : EditorWindow
             bool active = group == _activeSceneColorGroup;
             Rect rect = filterRects[i];
             rect.position += new Vector2(filterArea.x + 6f, filterArea.y);
-            string tooltip = "Tabs: " + names + "\nFarbe: #" + group.key
-                + "\nZeigt angeheftete Objekte einschließlich ihrer Unterobjekte."
-                + (active ? "\nErneut klicken, um den Farbfilter aufzuheben." : "");
-            if (GUI.Button(rect, new GUIContent("", tooltip), EditorStyles.miniButton))
+            string tooltip = "Tab: " + names
+                + "\nZeigt dessen angeheftete Objekte einschließlich ihrer Unterobjekte."
+                + (active ? "\nErneut klicken, um den Tab-Filter aufzuheben." : "");
+            if (GUI.Button(rect, new GUIContent(names, tooltip),
+                active ? EditorStyles.miniButtonMid : EditorStyles.miniButton))
             {
                 _sceneColorFilterTab = active ? null : group.tabs[0];
                 _activeSceneColorGroup = active ? null : group;
@@ -1171,9 +1765,6 @@ public class HierarchyOrganizerWindow : EditorWindow
                 _globalScroll = Vector2.zero;
                 StateChanged();
             }
-            EditorGUI.DrawRect(new Rect(rect.x + 6, rect.center.y - 5, 20, 10),
-                new Color(group.color.r, group.color.g, group.color.b, 1f));
-            GUI.Label(new Rect(rect.x + 31, rect.y + 4, rect.width - 38, rect.height - 8), filterLabels[i], labelStyle);
             if (active)
                 EditorGUI.DrawRect(new Rect(rect.x + 2, rect.yMax - 3, rect.width - 4, 2), group.color);
         }
@@ -1193,39 +1784,22 @@ public class HierarchyOrganizerWindow : EditorWindow
 
     void DrawViewModeBar(TabData tab)
     {
+        bool compact = CompactLayout;
         EditorGUILayout.BeginHorizontal(GUILayout.Height(26));
         GUILayout.Space(6);
 
-        // 1 = Pinned (Tab-Inhalt), 0 = Hierarchy (Ganze Szene), 2 = History (Verlauf)
-        DrawModeBtn(tab, 1, "📌 Tab-Inhalt " + (tab.pinnedIDs.Count > 0 ? "(" + tab.pinnedIDs.Count + ")" : ""));
-        DrawModeBtn(tab, 0, "🌐 Ganze Szene");
-        DrawModeBtn(tab, 2, "⏱ Verlauf " + (tab.history.Count > 0 ? "(" + tab.history.Count + ")" : ""));
+        // 1 = Pinned (Tab-Inhalt), 0 = Hierarchy (Ganze Szene)
+        DrawModeBtn(tab, 1, (compact ? "📌 " : "📌 Tab-Inhalt ") + (tab.pinnedIDs.Count > 0 ? "(" + tab.pinnedIDs.Count + ")" : ""));
+        DrawModeBtn(tab, 0, compact ? "🌐 Szene" : "🌐 Ganze Szene");
 
         GUILayout.FlexibleSpace();
 
-        var nc = tab.showNotes ? new Color(1f, 0.9f, 0.35f) : new Color(0.7f, 0.7f, 0.7f);
-        var oc = GUI.color; GUI.color = nc;
-        if (GUILayout.Button("✏ Notiz", EditorStyles.miniButton, GUILayout.Width(52)))
-            tab.showNotes = !tab.showNotes;
-        GUI.color = oc;
-
-        var lc2 = tab.locked ? ColLocked : new Color(0.7f, 0.7f, 0.7f);
-        GUI.color = lc2;
-        if (GUILayout.Button(tab.locked ? "🔒 Gesperrt" : "🔓 Offen", EditorStyles.miniButton, GUILayout.Width(70)))
-            tab.locked = !tab.locked;
-        GUI.color = oc;
-
         if (tab.viewMode == 1 && tab.pinnedIDs.Count > 0)
         {
-            if (GUILayout.Button("Leeren", EditorStyles.miniButton, GUILayout.Width(46)))
+            if (GUILayout.Button(new GUIContent(compact ? "⌫" : "Leeren", "Alle angehefteten Objekte aus diesem Tab entfernen."),
+                EditorStyles.miniButton, GUILayout.Width(compact ? 25f : 46f)))
                 tab.pinnedIDs.Clear();
         }
-        if (tab.viewMode == 2 && tab.history.Count > 0)
-        {
-            if (GUILayout.Button("Leeren", EditorStyles.miniButton, GUILayout.Width(46)))
-                tab.history.Clear();
-        }
-
         GUILayout.Space(6);
         EditorGUILayout.EndHorizontal();
 
@@ -1244,7 +1818,7 @@ public class HierarchyOrganizerWindow : EditorWindow
         var fgOld = GUI.color;
         GUI.color = active ? Color.white : new Color(0.85f, 0.85f, 0.85f);
 
-        if (GUILayout.Button(label, EditorStyles.miniButtonMid, GUILayout.Width(100)))
+        if (GUILayout.Button(label, EditorStyles.miniButtonMid, GUILayout.Width(CompactLayout ? 72f : 100f)))
             tab.viewMode = mode;
 
         GUI.backgroundColor = old;
@@ -1280,12 +1854,12 @@ public class HierarchyOrganizerWindow : EditorWindow
             return;
         }
 
+        DrawFolderNames(tab);
         tab.scroll = EditorGUILayout.BeginScrollView(tab.scroll);
         switch (tab.viewMode)
         {
             case 1: DrawPinnedView(tab);    break;
             case 0: DrawHierarchyView(tab); break;
-            case 2: DrawHistoryView(tab);   break;
         }
         EditorGUILayout.EndScrollView();
     }
@@ -1293,6 +1867,216 @@ public class HierarchyOrganizerWindow : EditorWindow
     // ══════════════════════════════════════════════
     //  Global Search
     // ══════════════════════════════════════════════
+
+    void DrawFolderNames(TabData tab)
+    {
+        if (tab.folderNames == null) tab.folderNames = new List<string>();
+        EditorGUILayout.BeginVertical(EditorStyles.helpBox);
+        bool expanded = EditorGUILayout.Foldout(tab.showFolderNames,
+            T("Ordner-Namensliste", "Folder names"), true);
+        if (expanded != tab.showFolderNames)
+        {
+            tab.showFolderNames = expanded;
+            StateChanged();
+        }
+        if (expanded)
+        {
+            using (new EditorGUI.DisabledScope(tab.locked || EditorApplication.isPlayingOrWillChangePlaymode))
+            {
+                Rect dropBox = GUILayoutUtility.GetRect(0, 58f, GUILayout.ExpandWidth(true));
+                GUI.Box(dropBox, T("＋ Hier hineinziehen\nOrdner aus den Namen erstellen",
+                    "＋ Drop here\nCreate folders from names"), EditorStyles.helpBox);
+                HandleFolderNameDrop(dropBox, tab, null);
+                EditorGUILayout.BeginHorizontal();
+                tab.newFolderName = EditorGUILayout.TextField(tab.newFolderName ?? "");
+                string name = (tab.newFolderName ?? "").Trim();
+                using (new EditorGUI.DisabledScope(name.Length == 0))
+                {
+                    if (GUILayout.Button(T("+ Name", "+ Name"), GUILayout.Width(70)))
+                    {
+                        if (!tab.folderNames.Any(n => string.Equals(n, name, System.StringComparison.OrdinalIgnoreCase)))
+                            tab.folderNames.Add(name);
+                        tab.newFolderName = "";
+                        GUI.FocusControl(null);
+                        StateChanged();
+                    }
+                }
+                EditorGUILayout.EndHorizontal();
+                int remove = -1;
+                for (int i = 0; i < tab.folderNames.Count; i++)
+                {
+                    string folderName = tab.folderNames[i];
+                    EditorGUILayout.BeginHorizontal();
+                    if (GUILayout.Button(new GUIContent("📁 " + folderName,
+                        T("Objekte hier hineinziehen. Klick öffnet den Ordner.",
+                          "Drop objects here. Click to open the folder.")), GUILayout.Height(28)))
+                    {
+                        EditorApplication.delayCall += () =>
+                        {
+                            if (this != null && _tabs.Contains(tab)) InsertNamedFolder(tab, folderName, new Object[0]);
+                        };
+                    }
+                    HandleFolderNameDrop(GUILayoutUtility.GetLastRect(), tab, folderName);
+                    if (GUILayout.Button(new GUIContent("×", T("Nur diesen Namen aus der Liste entfernen.",
+                        "Remove only this name from the list.")), GUILayout.Width(22))) remove = i;
+                    EditorGUILayout.EndHorizontal();
+                }
+                if (remove >= 0)
+                {
+                    tab.folderNames.RemoveAt(remove);
+                    StateChanged();
+                }
+                GUILayout.Label(T("Oben: Namen übernehmen. Unten: Objekte auf einen Ordnernamen ziehen.",
+                    "Above: add folder names. Below: drop objects onto a folder name."), EditorStyles.wordWrappedMiniLabel);
+            }
+        }
+        EditorGUILayout.EndVertical();
+    }
+
+    static bool IsOrganizerFolder(GameObject go)
+    {
+        return go != null && !PrefabUtility.IsPartOfAnyPrefab(go)
+            && go.GetComponents<Component>().Length == 1;
+    }
+
+    bool CanFileDroppedObject(Object obj)
+    {
+        var go = obj as GameObject;
+        if (go == null) return false;
+        if (EditorUtility.IsPersistent(go)) return PrefabUtility.IsPartOfPrefabAsset(go);
+        return IsObjectInContext(go) && (!PrefabUtility.IsPartOfAnyPrefab(go)
+            || PrefabUtility.GetOutermostPrefabInstanceRoot(go) == go);
+    }
+
+    void HandleFolderNameDrop(Rect rect, TabData tab, string targetName)
+    {
+        var e = Event.current;
+        if (!rect.Contains(e.mousePosition) || tab.locked || !GUI.enabled
+            || EditorApplication.isPlayingOrWillChangePlaymode
+            || PrefabStageUtility.GetCurrentPrefabStage() != null) return;
+        if (e.type != EventType.DragUpdated && e.type != EventType.DragPerform) return;
+        Object[] objects = DragAndDrop.objectReferences.Where(o => o != null).ToArray();
+        string[] names = objects.Select(o => o.name.Trim()).Where(n => n.Length > 0)
+            .Distinct(System.StringComparer.OrdinalIgnoreCase).ToArray();
+        bool acceptable = targetName == null ? names.Length > 0
+            : objects.Length > 0 && objects.All(CanFileDroppedObject);
+        DragAndDrop.visualMode = !acceptable ? DragAndDropVisualMode.Rejected
+            : targetName == null || objects.Any(EditorUtility.IsPersistent)
+                ? DragAndDropVisualMode.Copy : DragAndDropVisualMode.Move;
+        if (e.type == EventType.DragPerform && acceptable)
+        {
+            DragAndDrop.AcceptDrag();
+            Scene scene = _dataScene;
+            EditorApplication.delayCall += () =>
+            {
+                if (this == null || !_tabs.Contains(tab) || _dataScene != scene || tab.locked) return;
+                if (targetName == null)
+                {
+                    foreach (string name in names)
+                    {
+                        string existing = tab.folderNames.FirstOrDefault(n =>
+                            string.Equals(n, name, System.StringComparison.OrdinalIgnoreCase));
+                        if (existing == null) tab.folderNames.Add(name);
+                        InsertNamedFolder(tab, existing ?? name, new Object[0]);
+                    }
+                }
+                else InsertNamedFolder(tab, targetName, objects);
+                StateChanged();
+            };
+        }
+        e.Use();
+    }
+
+    void InsertNamedFolder(TabData tab, string folderName, Object[] selection)
+    {
+        if (tab.locked || EditorApplication.isPlayingOrWillChangePlaymode
+            || !_dataScene.IsValid() || !_dataScene.isLoaded
+            || PrefabStageUtility.GetCurrentPrefabStage() != null) return;
+        if (IsProjectTab(tab))
+        {
+            var projectTab = tab;
+            if (string.IsNullOrEmpty(projectTab.projectSourceId))
+                projectTab.projectSourceId = System.Guid.NewGuid().ToString("N");
+            tab = _tabs.FirstOrDefault(t => !IsProjectTab(t)
+                && t.groupedProjectSourceId == projectTab.projectSourceId);
+            if (tab == null)
+            {
+                tab = new TabData
+                {
+                    name = projectTab.name, tabKind = 0, viewMode = 1, iconEmoji = "📁",
+                    colorIndex = projectTab.colorIndex,
+                    groupedProjectSourceId = projectTab.projectSourceId
+                };
+                _tabs.Add(tab);
+            }
+            if (tab.locked) return;
+            if (tab.folderNames == null) tab.folderNames = new List<string>();
+            if (!tab.folderNames.Contains(folderName)) tab.folderNames.Add(folderName);
+        }
+        // Automatically grouped tabs keep their named folders under the source group.
+        GameObject sourceGroup = string.IsNullOrEmpty(tab.groupedProjectSourceId) ? null
+            : tab.pinnedIDs.Select(id => EditorUtility.EntityIdToObject(id) as GameObject)
+                .FirstOrDefault(go => IsObjectInContext(go) && IsOrganizerFolder(go));
+        IEnumerable<GameObject> candidates = sourceGroup != null
+            ? sourceGroup.transform.Cast<Transform>().Select(t => t.gameObject)
+            : tab.viewMode == 0 ? _dataScene.GetRootGameObjects()
+            : tab.pinnedIDs.Select(id => EditorUtility.EntityIdToObject(id) as GameObject);
+        GameObject folder = candidates.FirstOrDefault(go => IsObjectInContext(go)
+            && IsOrganizerFolder(go) && go.name == folderName);
+        Undo.IncrementCurrentGroup();
+        int undoGroup = Undo.GetCurrentGroup();
+        string action = "Sort into " + folderName;
+        Undo.SetCurrentGroupName(action);
+        if (sourceGroup == null && !string.IsNullOrEmpty(tab.groupedProjectSourceId))
+        {
+            sourceGroup = new GameObject(tab.name);
+            SceneManager.MoveGameObjectToScene(sourceGroup, _dataScene);
+            Undo.RegisterCreatedObjectUndo(sourceGroup, action);
+            tab.pinnedIDs.Add(sourceGroup.GetEntityId());
+        }
+        if (folder == null)
+        {
+            folder = new GameObject(folderName);
+            SceneManager.MoveGameObjectToScene(folder, _dataScene);
+            Undo.RegisterCreatedObjectUndo(folder, action);
+            if (sourceGroup != null) Undo.SetTransformParent(folder.transform, sourceGroup.transform, action);
+        }
+        var droppedObjects = new List<GameObject>();
+        foreach (var obj in selection ?? new Object[0])
+        {
+            if (!CanFileDroppedObject(obj)) continue;
+            var go = (GameObject)obj;
+            if (EditorUtility.IsPersistent(go))
+            {
+                go = PrefabUtility.InstantiatePrefab(go, _dataScene) as GameObject;
+                if (go == null) continue;
+                Undo.RegisterCreatedObjectUndo(go, action);
+            }
+            droppedObjects.Add(go);
+        }
+        var selected = new HashSet<GameObject>(droppedObjects
+            .Where(go => IsObjectInContext(go) && go != folder && go != sourceGroup
+                && !folder.transform.IsChildOf(go.transform)
+                && (!PrefabUtility.IsPartOfAnyPrefab(go) || PrefabUtility.GetOutermostPrefabInstanceRoot(go) == go)));
+        foreach (var go in selected)
+        {
+            bool ancestorSelected = false;
+            for (var parent = go.transform.parent; parent != null; parent = parent.parent)
+                if (selected.Contains(parent.gameObject)) { ancestorSelected = true; break; }
+            if (!ancestorSelected && go.transform.parent != folder.transform)
+                Undo.SetTransformParent(go.transform, folder.transform, action);
+        }
+        Undo.CollapseUndoOperations(undoGroup);
+        EntityId folderId = folder.GetEntityId();
+        if (sourceGroup == null && !tab.pinnedIDs.Contains(folderId)) tab.pinnedIDs.Add(folderId);
+        if (sourceGroup != null) _expanded.Add(sourceGroup.GetEntityId());
+        _expanded.Add(folderId);
+        Selection.activeGameObject = folder;
+        EditorGUIUtility.PingObject(folder);
+        EditorSceneManager.MarkSceneDirty(_dataScene);
+        _hierarchyVersion++;
+        StateChanged();
+    }
 
     void DrawGlobalSearchResults()
     {
@@ -1306,7 +2090,7 @@ public class HierarchyOrganizerWindow : EditorWindow
         var hits = GetFilteredSceneObjects(CurrentTab, _globalQuery, true);
 
         GUILayout.Label("  " + hits.Count + (_activeSceneColorGroup == null
-            ? " Treffer in der gesamten Szene" : " Treffer mit gewählter Tab-Farbe"), EditorStyles.boldLabel);
+            ? " Treffer in der gesamten Szene" : " Treffer im gewählten Tab"), EditorStyles.boldLabel);
         EditorGUI.DrawRect(GUILayoutUtility.GetRect(0, 1, GUILayout.ExpandWidth(true)), ColSep);
 
         _globalScroll = EditorGUILayout.BeginScrollView(_globalScroll);
@@ -1594,6 +2378,8 @@ public class HierarchyOrganizerWindow : EditorWindow
 
         float indent = depth * 16f + 6f;
         float midY   = rect.y + rowH * 0.5f;
+        float controlSize = Mathf.Min(18f, rowH);
+        float iconSize = Mathf.Min(16f, Mathf.Max(10f, rowH - 1f));
 
         if (_showHierarchyLines && depth > 0)
         {
@@ -1604,7 +2390,7 @@ public class HierarchyOrganizerWindow : EditorWindow
 
         if (hasChildren)
         {
-            var arrowRect = new Rect(rect.x + indent - 2, midY - 9, 18, 18);
+            var arrowRect = new Rect(rect.x + indent - 2, midY - controlSize * 0.5f, controlSize, controlSize);
             if (GUI.Button(arrowRect, expanded ? "▾" : "▸", EditorStyles.miniLabel))
             {
                 if (expanded) _expanded.Remove(id);
@@ -1619,7 +2405,7 @@ public class HierarchyOrganizerWindow : EditorWindow
         {
             var oldI = GUI.color;
             if (inactive) GUI.color = new Color(1, 1, 1, 0.45f);
-            GUI.DrawTexture(new Rect(cx, midY - 8, 16, 16), ic, ScaleMode.ScaleToFit);
+            GUI.DrawTexture(new Rect(cx, midY - iconSize * 0.5f, iconSize, iconSize), ic, ScaleMode.ScaleToFit);
             GUI.color = oldI;
         }
         cx += 20f;
@@ -1630,7 +2416,27 @@ public class HierarchyOrganizerWindow : EditorWindow
                   :             new Color(0.96f, 0.96f, 0.96f);
 
         float rightButtonsWidth = isPinnedList ? 110f : 90f;
-        GUI.Label(new Rect(cx, midY - 9, rect.width - cx - rightButtonsWidth, 18), go.name, _stEntryName ?? EditorStyles.label);
+        string membership = tab.viewMode == 0 ? GetTabMembership(go) : "";
+        float availableTextWidth = Mathf.Max(1f, rect.xMax - rightButtonsWidth - cx);
+        var entryStyle = _stEntryName ?? EditorStyles.label;
+        if (string.IsNullOrEmpty(membership))
+        {
+            GUI.Label(new Rect(cx, rect.y, availableTextWidth, rowH), go.name, entryStyle);
+        }
+        else
+        {
+            float nameWidth = Mathf.Min(availableTextWidth,
+                Mathf.Ceil(entryStyle.CalcSize(new GUIContent(go.name)).x) + 5f);
+            GUI.Label(new Rect(cx, rect.y, nameWidth, rowH), go.name, entryStyle);
+            if (availableTextWidth > nameWidth)
+            {
+                var membershipColor = GUI.color;
+                GUI.color = Color.black;
+                GUI.Label(new Rect(cx + nameWidth, rect.y, availableTextWidth - nameWidth, rowH),
+                    new GUIContent("‹" + membership + "›", T("Organizer-Tabs: ", "Organizer tabs: ") + membership), entryStyle);
+                GUI.color = membershipColor;
+            }
+        }
         GUI.color = old;
 
         if (_showComponentIcons)
@@ -1642,7 +2448,8 @@ public class HierarchyOrganizerWindow : EditorWindow
         if (isPinnedList && depth == 0)
         {
             var oc = GUI.color; GUI.color = new Color(1f, 0.45f, 0.45f, hover ? 0.95f : 0.4f);
-            if (GUI.Button(new Rect(btnX, midY - 9, 18, 18), "✕", EditorStyles.miniLabel))
+            if (GUI.Button(new Rect(btnX, midY - controlSize * 0.5f, controlSize, controlSize),
+                new GUIContent("✕", T("Aus dem Tab entfernen", "Remove from tab")), EditorStyles.miniLabel))
             {
                 tab.pinnedIDs.Remove(id);
                 StateChanged();
@@ -1655,7 +2462,7 @@ public class HierarchyOrganizerWindow : EditorWindow
 
         var starC = isFav ? ColFav : new Color(0.5f, 0.5f, 0.5f, hover ? 0.9f : 0.2f);
         GUI.color = starC;
-        if (GUI.Button(new Rect(btnX, midY - 9, 18, 18), "★", EditorStyles.miniLabel))
+        if (GUI.Button(new Rect(btnX, midY - controlSize * 0.5f, controlSize, controlSize), "★", EditorStyles.miniLabel))
         {
             if (isFav) _favorites.Remove(id);
             else       _favorites.Add(id);
@@ -1666,7 +2473,7 @@ public class HierarchyOrganizerWindow : EditorWindow
         if (hover || !go.activeSelf)
         {
             GUI.color = go.activeSelf ? new Color(0.7f, 0.95f, 1f) : new Color(0.6f, 0.6f, 0.6f, 0.6f);
-            if (GUI.Button(new Rect(btnX, midY - 9, 18, 18), go.activeSelf ? "👁" : "○", EditorStyles.miniLabel))
+            if (GUI.Button(new Rect(btnX, midY - controlSize * 0.5f, controlSize, controlSize), go.activeSelf ? "👁" : "○", EditorStyles.miniLabel))
             {
                 Undo.RecordObject(go, "Toggle Active");
                 go.SetActive(!go.activeSelf);
@@ -1678,7 +2485,7 @@ public class HierarchyOrganizerWindow : EditorWindow
         if (hover)
         {
             GUI.color = new Color(0.9f, 0.9f, 0.9f, 0.85f);
-            if (GUI.Button(new Rect(btnX, midY - 9, 18, 18), "🎯", EditorStyles.miniLabel))
+            if (GUI.Button(new Rect(btnX, midY - controlSize * 0.5f, controlSize, controlSize), "🎯", EditorStyles.miniLabel))
             {
                 Selection.activeGameObject = go;
                 if (SceneView.lastActiveSceneView != null)
@@ -1687,7 +2494,7 @@ public class HierarchyOrganizerWindow : EditorWindow
             GUI.color = old;
         }
 
-        HandleEntryEvents(rect, go, tab);
+        HandleEntryEvents(rect, go, tab, isPinnedList && depth == 0, pinnedIndex);
 
         if (hasChildren && expanded)
         {
@@ -1704,6 +2511,29 @@ public class HierarchyOrganizerWindow : EditorWindow
         return components;
     }
 
+    string GetTabMembership(GameObject go)
+    {
+        EntityId objectId = go.GetEntityId();
+        if (_tabMembershipCache.TryGetValue(objectId, out string cached)) return cached;
+
+        var names = new List<string>();
+        for (int i = 0; i < _tabs.Count; i++)
+        {
+            var organizerTab = _tabs[i];
+            if (IsProjectTab(organizerTab) || IsHierarchyTab(organizerTab))
+                continue;
+
+            bool belongs = false;
+            for (Transform current = go.transform; current != null && !belongs; current = current.parent)
+                belongs = organizerTab.pinnedIDs.Contains(current.gameObject.GetEntityId());
+            if (belongs && !string.IsNullOrWhiteSpace(organizerTab.name)) names.Add(organizerTab.name.Trim());
+        }
+
+        string result = string.Join(", ", names);
+        _tabMembershipCache[objectId] = result;
+        return result;
+    }
+
     void DrawComponentIcons(GameObject go, Rect rect, float midY)
     {
         if (Event.current.type != EventType.Repaint) return;
@@ -1713,6 +2543,7 @@ public class HierarchyOrganizerWindow : EditorWindow
             if (components == null) return;
 
             int drawn = 0;
+            float iconSize = Mathf.Min(14f, Mathf.Max(9f, rect.height - 1f));
             float ix  = rect.xMax - 70;
             var   old = GUI.color;
 
@@ -1724,8 +2555,8 @@ public class HierarchyOrganizerWindow : EditorWindow
                 if (content?.image != null)
                 {
                     GUI.color = new Color(1, 1, 1, 0.75f);
-                    GUI.DrawTexture(new Rect(ix, midY - 7, 14, 14), content.image, ScaleMode.ScaleToFit);
-                    ix -= 16f;
+                    GUI.DrawTexture(new Rect(ix, midY - iconSize * 0.5f, iconSize, iconSize), content.image, ScaleMode.ScaleToFit);
+                    ix -= iconSize + 2f;
                     drawn++;
                 }
             }
@@ -1740,8 +2571,7 @@ public class HierarchyOrganizerWindow : EditorWindow
 
     void DrawPinnedView(TabData tab)
     {
-        HandleWindowDragDrop(tab);
-        DrawProjectFolders(tab);
+        if (IsProjectTab(tab)) DrawProjectFolders(tab);
 
         if (tab.pinnedIDs.Count == 0 && (tab.folderGuids == null || tab.folderGuids.Count == 0))
         {
@@ -1749,14 +2579,16 @@ public class HierarchyOrganizerWindow : EditorWindow
 
             EditorGUILayout.BeginVertical(EditorStyles.helpBox);
             GUILayout.Space(10);
-            GUILayout.Label("📁 Dieser Tab ist leer", EditorStyles.boldLabel);
+            GUILayout.Label(T("📁 Dieser Tab ist leer", "📁 This tab is empty"), EditorStyles.boldLabel);
             GUILayout.Space(4);
-            GUILayout.Label("Hefte Szenenobjekte oder Projektordner hier an:", EditorStyles.label);
+            GUILayout.Label(T("Hefte Szenenobjekte oder Projektordner hier an:", "Pin scene objects or project folders here:"), EditorStyles.label);
             GUILayout.Space(10);
 
             int selCount = Selection.gameObjects != null ? Selection.gameObjects.Length : 0;
             var sc = GUI.color; GUI.color = new Color(0.35f, 0.85f, 1f);
-            if (GUILayout.Button(selCount > 0 ? "＋ Ausgewählte Objekte anheften (" + selCount + " markiert)" : "＋ Ausgewählte Objekte anheften", GUILayout.Height(30)))
+            if (GUILayout.Button(selCount > 0
+                    ? T("＋ Ausgewählte Objekte anheften (" + selCount + " markiert)", "＋ Pin selected objects (" + selCount + " selected)")
+                    : T("＋ Ausgewählte Objekte anheften", "＋ Pin selected objects"), GUILayout.Height(30)))
             {
                 if (Selection.gameObjects != null && Selection.gameObjects.Length > 0)
                 {
@@ -1764,24 +2596,28 @@ public class HierarchyOrganizerWindow : EditorWindow
                     {
                         if (!IsObjectInContext(go)) continue;
                         EntityId id = go.GetEntityId();
-                        if (!tab.pinnedIDs.Contains(id)) tab.pinnedIDs.Add(id);
+                        if (!tab.pinnedIDs.Contains(id))
+                        {
+                            tab.pinnedIDs.Add(id);
+                            _expanded.Add(id);
+                        }
                     }
                     StateChanged();
                 }
                 else
                 {
-                    ShowNotification(new GUIContent("Wähle zuerst Objekte in Unitys Hierarchy aus"));
+                    ShowNotification(new GUIContent(T("Wähle zuerst Objekte in Unitys Hierarchy aus", "Select objects in Unity's Hierarchy first")));
                 }
             }
             GUI.color = sc;
 
             GUILayout.Space(10);
-            GUILayout.Label("Möglichkeiten zum Hinzufügen:", EditorStyles.miniBoldLabel);
-            GUILayout.Label("1. Objekte aus der Unity Hierarchy per Drag & Drop direkt hier hineinziehen", EditorStyles.miniLabel);
-            GUILayout.Label("2. Unity Hierarchy → Rechtsklick auf Objekt → 'Pin to Hierarchy Organizer'", EditorStyles.miniLabel);
-            GUILayout.Label("3. Modus '🌐 Ganze Szene' wählen → Rechtsklick → 'Pin zu diesem Tab'", EditorStyles.miniLabel);
+            GUILayout.Label(T("Möglichkeiten zum Hinzufügen:", "Ways to add content:"), EditorStyles.miniBoldLabel);
+            GUILayout.Label(T("1. Objekte aus der Unity Hierarchy per Drag & Drop direkt hier hineinziehen", "1. Drag objects here from the Unity Hierarchy"), EditorStyles.miniLabel);
+            GUILayout.Label(T("2. Unity Hierarchy → Rechtsklick auf Objekt → 'Pin to Hierarchy Organizer'", "2. Unity Hierarchy → Right-click object → 'Pin to Hierarchy Organizer'"), EditorStyles.miniLabel);
             GUILayout.Space(10);
             EditorGUILayout.EndVertical();
+            HandleWindowDragDrop(tab);
             return;
         }
 
@@ -1790,20 +2626,25 @@ public class HierarchyOrganizerWindow : EditorWindow
         if (Selection.gameObjects != null && Selection.gameObjects.Length > 0)
         {
             var sc = GUI.color; GUI.color = new Color(0.4f, 0.9f, 0.5f);
-            if (GUILayout.Button("＋ " + Selection.gameObjects.Length + " ausgewählte anheften", EditorStyles.miniButton, GUILayout.Width(175)))
+            if (GUILayout.Button(T("＋ " + Selection.gameObjects.Length + " ausgewählte anheften",
+                    "＋ Pin " + Selection.gameObjects.Length + " selected"), EditorStyles.miniButton, GUILayout.Width(175)))
             {
                 foreach (var go in Selection.gameObjects)
                 {
                     if (!IsObjectInContext(go)) continue;
                     EntityId id = go.GetEntityId();
-                    if (!tab.pinnedIDs.Contains(id)) tab.pinnedIDs.Add(id);
+                    if (!tab.pinnedIDs.Contains(id))
+                    {
+                        tab.pinnedIDs.Add(id);
+                        _expanded.Add(id);
+                    }
                 }
                 StateChanged();
             }
             GUI.color = sc;
         }
         GUILayout.FlexibleSpace();
-        GUILayout.Label(tab.pinnedIDs.Count + " Objekt(e) angeheftet", EditorStyles.miniLabel);
+        GUILayout.Label(tab.pinnedIDs.Count + T(" Objekt(e) angeheftet", " object(s) pinned"), EditorStyles.miniLabel);
         GUILayout.Space(6);
         EditorGUILayout.EndHorizontal();
 
@@ -1817,6 +2658,7 @@ public class HierarchyOrganizerWindow : EditorWindow
             DrawTreeNode(go, 0, tab, ref row, isPinnedList: true, pinnedIndex: p);
         }
         foreach (var id in missing) tab.pinnedIDs.Remove(id);
+        HandleWindowDragDrop(tab);
     }
 
     sealed class FolderPrefabCache
@@ -1826,7 +2668,9 @@ public class HierarchyOrganizerWindow : EditorWindow
         public GUIContent title;
         public string[] prefabs;
         public string[] labels;
-        public GUIContent[] rowContents;
+        public GUIContent[] cardContents;
+        public GameObject[] previewAssets;
+        public double[] previewRetryUntil;
         public string query;
         public int[] matches;
 
@@ -1837,7 +2681,9 @@ public class HierarchyOrganizerWindow : EditorWindow
                 prefabs = AssetDatabase.FindAssets("t:Prefab", new[] { path })
                     .Select(AssetDatabase.GUIDToAssetPath).OrderBy(p => p).ToArray();
                 labels = prefabs.Select(p => p.Substring(path.Length + 1)).ToArray();
-                rowContents = new GUIContent[prefabs.Length];
+                cardContents = new GUIContent[prefabs.Length];
+                previewAssets = new GameObject[prefabs.Length];
+                previewRetryUntil = new double[prefabs.Length];
             }
             search = search ?? "";
             if (matches != null && query == search) return;
@@ -1848,19 +2694,248 @@ public class HierarchyOrganizerWindow : EditorWindow
     }
 
     readonly Dictionary<string, FolderPrefabCache> _folderPrefabCache = new Dictionary<string, FolderPrefabCache>();
+    readonly Dictionary<string, int> _prefabInstanceCounts = new Dictionary<string, int>();
+    int _prefabInstanceCountVersion = -1;
     readonly HashSet<string> _collapsedFolders = new HashSet<string>();
     Object _pendingAssetDrag;
+    TabData _pendingAssetDragTab;
+    int _prefabCardControlId;
+
+    void HandlePrefabCardGesture()
+    {
+        if (_pendingAssetDrag == null) return;
+        var e = Event.current;
+        if (e.type == EventType.KeyDown && e.keyCode == KeyCode.Escape)
+        {
+            if (GUIUtility.hotControl == _prefabCardControlId) GUIUtility.hotControl = 0;
+            _pendingAssetDrag = null;
+            _pendingAssetDragTab = null;
+            e.Use();
+            return;
+        }
+        if (e.type == EventType.MouseDrag && e.button == 0
+            && GUIUtility.hotControl == _prefabCardControlId)
+        {
+            if (Vector2.Distance(GUIUtility.GUIToScreenPoint(e.mousePosition), _assetDragStart) > DragThreshold)
+            {
+                var asset = _pendingAssetDrag;
+                var source = _pendingAssetDragTab;
+                GUIUtility.hotControl = 0;
+                DragAndDrop.PrepareStartDrag();
+                DragAndDrop.objectReferences = new[] { asset };
+                DragAndDrop.paths = new[] { AssetDatabase.GetAssetPath(asset) };
+                if (source != null && _tabs.Contains(source)) TrackProjectDrag(source, asset);
+                DragAndDrop.StartDrag(asset.name);
+                _pendingAssetDrag = null;
+                _pendingAssetDragTab = null;
+            }
+            e.Use();
+        }
+        else if (e.rawType == EventType.MouseUp && e.button == 0)
+        {
+            var asset = _pendingAssetDrag;
+            bool ownsGesture = GUIUtility.hotControl == _prefabCardControlId;
+            if (ownsGesture) GUIUtility.hotControl = 0;
+            _pendingAssetDrag = null;
+            _pendingAssetDragTab = null;
+            if (ownsGesture)
+            {
+                Selection.activeObject = asset;
+                EditorGUIUtility.PingObject(asset);
+                e.Use();
+            }
+        }
+    }
+    const string ProjectDragKey = "HierarchyOrganizer.ProjectSourceDrag";
+
+    sealed class ProjectSourceDrag
+    {
+        public HierarchyOrganizerWindow owner;
+        public TabData source;
+        public Scene scene;
+        public string prefabPath;
+        public HashSet<EntityId> existing = new HashSet<EntityId>();
+        public bool scheduled;
+    }
+
+    void TrackProjectDrag(TabData source, Object asset)
+    {
+        if (!_autoNameTabs)
+        {
+            DragAndDrop.SetGenericData(ProjectDragKey, null);
+            return;
+        }
+        if (EditorApplication.isPlayingOrWillChangePlaymode || !_dataScene.IsValid()
+            || !_dataScene.isLoaded || PrefabStageUtility.GetCurrentPrefabStage() != null) return;
+        if (string.IsNullOrEmpty(source.projectSourceId))
+        {
+            source.projectSourceId = System.Guid.NewGuid().ToString("N");
+            StateChanged();
+        }
+        var drag = new ProjectSourceDrag
+        {
+            owner = this, source = source, scene = _dataScene,
+            prefabPath = AssetDatabase.GetAssetPath(asset)
+        };
+        foreach (var go in Resources.FindObjectsOfTypeAll<GameObject>())
+            if (go.scene == drag.scene) drag.existing.Add(go.GetEntityId());
+        DragAndDrop.SetGenericData(ProjectDragKey, drag);
+    }
+
+    DragAndDropVisualMode ObserveProjectSceneDrop(Object target, Vector3 worldPosition,
+        Vector2 viewportPosition, Transform parent, bool perform)
+    {
+        if (perform) QueueProjectGrouping();
+        return DragAndDropVisualMode.None;
+    }
+
+    DragAndDropVisualMode ObserveProjectHierarchyDrop(EntityId target, HierarchyDropFlags flags,
+        Transform parent, bool perform)
+    {
+        if (perform) QueueProjectGrouping();
+        return DragAndDropVisualMode.None;
+    }
+
+    void QueueProjectGrouping()
+    {
+        var drag = DragAndDrop.GetGenericData(ProjectDragKey) as ProjectSourceDrag;
+        if (drag == null || drag.owner != this || drag.scheduled
+            || PrefabStageUtility.GetCurrentPrefabStage() != null) return;
+        if (!DragAndDrop.objectReferences.Any(o => o != null &&
+            AssetDatabase.GetAssetPath(o) == drag.prefabPath)) return;
+        drag.scheduled = true;
+        // Let Unity finish its normal placement before touching the instance.
+        EditorApplication.delayCall += () =>
+        {
+            if (this != null) GroupProjectDrop(drag);
+        };
+    }
+
+    void GroupProjectDrop(ProjectSourceDrag drag)
+    {
+        if (!_autoNameTabs || EditorApplication.isPlayingOrWillChangePlaymode || !drag.scene.IsValid()
+            || !drag.scene.isLoaded || drag.scene != _dataScene || !_tabs.Contains(drag.source)
+            || PrefabStageUtility.GetCurrentPrefabStage() != null) return;
+        var instances = Resources.FindObjectsOfTypeAll<GameObject>().Where(go =>
+            go.scene == drag.scene && !EditorUtility.IsPersistent(go)
+            && go.hideFlags == HideFlags.None && !drag.existing.Contains(go.GetEntityId())
+            && PrefabUtility.GetOutermostPrefabInstanceRoot(go) == go
+            && PrefabUtility.GetPrefabAssetPathOfNearestInstanceRoot(go) == drag.prefabPath).ToArray();
+        // A cancelled/rejected drop must not create a tab or an empty scene group.
+        if (instances.Length == 0) return;
+
+        var hierarchyTab = _tabs.FirstOrDefault(t => !IsProjectTab(t)
+            && t.groupedProjectSourceId == drag.source.projectSourceId);
+        GameObject group = hierarchyTab == null ? null : hierarchyTab.pinnedIDs
+            .Select(id => EditorUtility.EntityIdToObject(id) as GameObject)
+            .FirstOrDefault(go => IsObjectInContext(go) && !PrefabUtility.IsPartOfAnyPrefab(go));
+
+        Undo.IncrementCurrentGroup();
+        int undoGroup = Undo.GetCurrentGroup();
+        Undo.SetCurrentGroupName("Group objects from " + drag.source.name);
+        if (group == null)
+        {
+            group = new GameObject(drag.source.name);
+            SceneManager.MoveGameObjectToScene(group, drag.scene);
+            Undo.RegisterCreatedObjectUndo(group, "Create project group");
+        }
+        foreach (var instance in instances)
+            Undo.SetTransformParent(instance.transform, group.transform, "Group project object");
+        Undo.CollapseUndoOperations(undoGroup);
+
+        if (hierarchyTab == null)
+        {
+            hierarchyTab = new TabData
+            {
+                name = drag.source.name, tabKind = 0, viewMode = 1, iconEmoji = "📁",
+                colorIndex = drag.source.colorIndex,
+                groupedProjectSourceId = drag.source.projectSourceId
+            };
+            _tabs.Add(hierarchyTab);
+        }
+        EntityId groupId = group.GetEntityId();
+        if (!hierarchyTab.pinnedIDs.Contains(groupId)) hierarchyTab.pinnedIDs.Add(groupId);
+        _expanded.Add(groupId);
+        EditorSceneManager.MarkSceneDirty(drag.scene);
+        _hierarchyVersion++;
+        StateChanged();
+    }
+
     Vector2 _assetDragStart;
+    bool _visiblePreviewsPending;
+    const string PreviewSizePrefKey = "HierarchyOrganizer.PrefabPreviewSize";
+    float _prefabPreviewSize = 104f;
+
+    void OnInspectorUpdate()
+    {
+        // Unity generates asset previews asynchronously; repaint at the editor's
+        // inspector cadence only while visible cards are waiting for an image.
+        if (_visiblePreviewsPending)
+        {
+            _visiblePreviewsPending = false;
+            Repaint();
+        }
+        if (_autoNameTabs || _tabs.Any(IsProjectTab)) Repaint();
+    }
+
+    Texture GetPrefabCardPreview(FolderPrefabCache cache, int index)
+    {
+        var asset = cache.previewAssets[index];
+        if (asset == null)
+        {
+            asset = AssetDatabase.LoadAssetAtPath<GameObject>(cache.prefabs[index]);
+            cache.previewAssets[index] = asset;
+        }
+        if (asset == null) return AssetDatabase.GetCachedIcon(cache.prefabs[index]);
+
+        Texture preview = AssetPreview.GetAssetPreview(asset);
+        if (preview != null)
+        {
+            cache.previewRetryUntil[index] = 0;
+            return preview;
+        }
+
+        double now = EditorApplication.timeSinceStartup;
+        if (cache.previewRetryUntil[index] == 0)
+            cache.previewRetryUntil[index] = now + 15.0;
+        // Some prefabs have no renderable content. Do not keep repainting forever.
+        if (now < cache.previewRetryUntil[index]) _visiblePreviewsPending = true;
+        return AssetPreview.GetMiniThumbnail(asset) ?? AssetDatabase.GetCachedIcon(cache.prefabs[index]);
+    }
 
     void RefreshFolderAssets()
     {
+        _visiblePreviewsPending = false;
         _folderPrefabCache.Clear();
+        _tagFilterOptions = null;
+        _layerFilterOptions = null;
+        _layerFilterValues = null;
         Repaint();
     }
 
     static bool IsProjectFolder(Object obj)
     {
         return obj != null && AssetDatabase.IsValidFolder(AssetDatabase.GetAssetPath(obj));
+    }
+
+    void EnsurePrefabInstanceCounts()
+    {
+        if (_prefabInstanceCountVersion == _hierarchyVersion) return;
+        _prefabInstanceCountVersion = _hierarchyVersion;
+        _prefabInstanceCounts.Clear();
+
+        var sceneObjects = Resources.FindObjectsOfTypeAll<GameObject>();
+        for (int i = 0; i < sceneObjects.Length; i++)
+        {
+            GameObject go = sceneObjects[i];
+            if (go == null || EditorUtility.IsPersistent(go) || !go.scene.IsValid() || !go.scene.isLoaded) continue;
+            GameObject instanceRoot = PrefabUtility.GetNearestPrefabInstanceRoot(go);
+            if (instanceRoot != go) continue;
+            string prefabPath = PrefabUtility.GetPrefabAssetPathOfNearestInstanceRoot(go);
+            if (string.IsNullOrEmpty(prefabPath)) continue;
+            _prefabInstanceCounts.TryGetValue(prefabPath, out int current);
+            _prefabInstanceCounts[prefabPath] = current + 1;
+        }
     }
 
     int AddDroppedFolders(TabData tab)
@@ -1879,23 +2954,59 @@ public class HierarchyOrganizerWindow : EditorWindow
         return added;
     }
 
-    void HandleNewFolderTabDrop(Rect rect)
+    bool CanAcceptNewAutoTabDrop(bool projectTab)
+    {
+        return projectTab
+            ? DragAndDrop.objectReferences.Any(IsProjectFolder)
+            : DragAndDrop.objectReferences.Any(obj => obj is GameObject go &&
+                !EditorUtility.IsPersistent(go) && IsObjectInContext(go));
+    }
+
+    void HandleNewAutoTabDrop(Rect rect, bool projectTab)
     {
         var e = Event.current;
-        if (!rect.Contains(e.mousePosition) || !DragAndDrop.objectReferences.Any(IsProjectFolder)) return;
+        bool acceptable = CanAcceptNewAutoTabDrop(projectTab);
+        if (!rect.Contains(e.mousePosition) || !acceptable) return;
         if (e.type == EventType.DragUpdated)
         {
             DragAndDrop.visualMode = DragAndDropVisualMode.Copy;
+            _dragOverTab = -2;
+            Repaint();
             e.Use();
         }
         else if (e.type == EventType.DragPerform)
         {
-            var first = DragAndDrop.objectReferences.First(IsProjectFolder);
-            var tab = new TabData { name = GetUniqueTabName(first.name), viewMode = 1 };
-            AddDroppedFolders(tab);
+            DragAndDrop.AcceptDrag();
+            TabData tab;
+            if (projectTab)
+            {
+                var first = DragAndDrop.objectReferences.First(IsProjectFolder);
+                tab = new TabData
+                {
+                    name = GetUniqueTabName(first.name), viewMode = 1, tabKind = 1,
+                    iconEmoji = "📁", colorIndex = _tabs.Count % PresetColors.Length
+                };
+                AddDroppedFolders(tab);
+            }
+            else
+            {
+                var objects = DragAndDrop.objectReferences.OfType<GameObject>()
+                    .Where(go => !EditorUtility.IsPersistent(go) && IsObjectInContext(go)).ToArray();
+                tab = new TabData
+                {
+                    name = GetUniqueTabName(objects[0].name), viewMode = 1, tabKind = 0,
+                    iconEmoji = "📁", colorIndex = _tabs.Count % PresetColors.Length
+                };
+                foreach (var go in objects)
+                {
+                    EntityId id = go.GetEntityId();
+                    if (!tab.pinnedIDs.Contains(id)) tab.pinnedIDs.Add(id);
+                    _expanded.Add(id);
+                }
+            }
             _tabs.Add(tab);
             _selectedTab = _tabs.Count - 1;
-            DragAndDrop.AcceptDrag();
+            _dragOverTab = -1;
             e.Use();
             StateChanged();
         }
@@ -1903,9 +3014,28 @@ public class HierarchyOrganizerWindow : EditorWindow
 
     void DrawProjectFolders(TabData tab)
     {
+        if (Event.current.type == EventType.Repaint) _visiblePreviewsPending = false;
+        EditorGUILayout.BeginHorizontal();
+        GUILayout.Label(T("Vorschaugröße", "Preview size"), EditorStyles.miniLabel, GUILayout.Width(90f));
+        EditorGUI.BeginChangeCheck();
+        float previewSize = GUILayout.HorizontalSlider(_prefabPreviewSize, 64f, 240f, GUILayout.MinWidth(60f), GUILayout.MaxWidth(220f));
+        if (EditorGUI.EndChangeCheck())
+        {
+            _prefabPreviewSize = Mathf.Round(previewSize);
+            EditorPrefs.SetFloat(PreviewSizePrefKey, _prefabPreviewSize);
+            Repaint();
+        }
+        GUILayout.Label(Mathf.RoundToInt(_prefabPreviewSize).ToString(), EditorStyles.miniLabel, GUILayout.Width(28f));
+        GUILayout.FlexibleSpace();
+        EditorGUILayout.EndHorizontal();
         if (tab.folderGuids == null) tab.folderGuids = new List<string>();
+        EnsurePrefabInstanceCounts();
         string remove = null;
-        foreach (string guid in tab.folderGuids)
+        string selectedAssetPath = AssetDatabase.GetAssetPath(Selection.activeObject);
+        IEnumerable<string> visibleFolderGuids = string.IsNullOrEmpty(tab.selectedProjectFolderGuid)
+            ? tab.folderGuids
+            : new[] { tab.selectedProjectFolderGuid };
+        foreach (string guid in visibleFolderGuids)
         {
             if (!_folderPrefabCache.TryGetValue(guid, out var cache))
             {
@@ -1925,70 +3055,121 @@ public class HierarchyOrganizerWindow : EditorWindow
             bool expanded = !_collapsedFolders.Contains(guid);
             bool next = EditorGUILayout.Foldout(expanded, cache.title, true);
             if (next) _collapsedFolders.Remove(guid); else _collapsedFolders.Add(guid);
-            if (exists && GUILayout.Button("Im Project", EditorStyles.miniButton, GUILayout.Width(75)))
+            if (exists && GUILayout.Button(T("Im Project", "In Project"), EditorStyles.miniButton, GUILayout.Width(75)))
             {
                 var folder = AssetDatabase.LoadAssetAtPath<Object>(path);
                 Selection.activeObject = folder;
                 EditorGUIUtility.PingObject(folder);
             }
-            if (GUILayout.Button(new GUIContent("×", "Ordner aus diesem Tab entfernen"), EditorStyles.miniButton, GUILayout.Width(22))) remove = guid;
+            if (tab.folderGuids.Contains(guid)
+                && GUILayout.Button(new GUIContent("×", T("Ordner aus diesem Tab entfernen", "Remove folder from this tab")), EditorStyles.miniButton, GUILayout.Width(22)))
+                remove = guid;
             EditorGUILayout.EndHorizontal();
             if (!next || !exists) continue;
             cache.EnsurePrefabs(tab.searchQuery);
             int count = cache.matches.Length;
             if (count == 0)
             {
-                GUILayout.Label("Keine passenden Prefabs in diesem Ordner oder seinen Unterordnern.", EditorStyles.miniLabel);
+                GUILayout.Label(T("Keine passenden Prefabs in diesem Ordner oder seinen Unterordnern.", "No matching prefabs in this folder or its subfolders."), EditorStyles.miniLabel);
                 continue;
             }
-            // Ein Layout-Rechteck für die ganze Liste; nur sichtbare Zeilen zeichnen.
-            // Die Fensterhöhe ist eine konservative Obergrenze für den Scroll-Viewport.
-            float rowHeight = Mathf.Max(1f, _rowHeight);
-            Rect listRect = GUILayoutUtility.GetRect(0, count * rowHeight, GUILayout.ExpandWidth(true));
+            // Spaltenanzahl und Kartenhöhe folgen der gewählten Vorschaugröße.
+            // Es werden weiterhin nur die sichtbaren Rasterzeilen gezeichnet.
+            float cardMinWidth = _prefabPreviewSize + 38f;
+            float cardHeight = _prefabPreviewSize + 50f;
+            const float cardGap = 4f;
+            Rect widthProbe = GUILayoutUtility.GetRect(0, 1f, GUILayout.ExpandWidth(true));
+            widthProbe.xMin += 18f;
+            float availableWidth = Mathf.Max(1f, widthProbe.width);
+            int columns = Mathf.Clamp(
+                Mathf.FloorToInt((availableWidth + cardGap) / (cardMinWidth + cardGap)),
+                1,
+                count);
+            int gridRows = Mathf.CeilToInt(count / (float)columns);
+            float gridHeight = gridRows * (cardHeight + cardGap) - cardGap;
+            Rect gridRect = GUILayoutUtility.GetRect(0, gridHeight, GUILayout.ExpandWidth(true));
+            gridRect.xMin += 18f;
             if (Event.current.type == EventType.Layout) continue;
-            int first = Mathf.Clamp(Mathf.FloorToInt((tab.scroll.y - listRect.y) / rowHeight), 0, count);
-            int end = Mathf.Clamp(Mathf.CeilToInt((tab.scroll.y + position.height - listRect.y) / rowHeight), first, count);
-            for (int visible = first; visible < end; visible++)
+            float cardWidth = (gridRect.width - (columns - 1) * cardGap) / columns;
+            float rowStride = cardHeight + cardGap;
+            int firstRow = Mathf.Clamp(Mathf.FloorToInt((tab.scroll.y - gridRect.y) / rowStride) - 1, 0, gridRows);
+            int endRow = Mathf.Clamp(Mathf.CeilToInt((tab.scroll.y + position.height - gridRect.y) / rowStride) + 1, firstRow, gridRows);
+            for (int gridRow = firstRow; gridRow < endRow; gridRow++)
             {
-                int index = cache.matches[visible];
-                string prefabPath = cache.prefabs[index];
-                Rect row = new Rect(listRect.x, listRect.y + visible * rowHeight, listRect.width, rowHeight);
-                row.xMin += 18;
-                var e = Event.current;
-                if (e.type == EventType.Repaint)
+                for (int column = 0; column < columns; column++)
                 {
-                    if (cache.rowContents[index] == null)
-                        cache.rowContents[index] = new GUIContent(cache.labels[index], AssetDatabase.GetCachedIcon(prefabPath), prefabPath);
-                    GUI.Label(row, cache.rowContents[index], EditorStyles.label);
-                }
-                if (e.type == EventType.MouseDown && e.button == 0 && row.Contains(e.mousePosition))
-                {
-                    var asset = AssetDatabase.LoadAssetAtPath<GameObject>(prefabPath);
-                    if (asset == null) continue;
-                    Selection.activeObject = asset;
-                    EditorGUIUtility.PingObject(asset);
-                    _pendingAssetDrag = asset;
-                    _assetDragStart = e.mousePosition;
-                    if (e.clickCount == 2) AssetDatabase.OpenAsset(asset);
-                    e.Use();
+                    int visible = gridRow * columns + column;
+                    if (visible >= count) break;
+                    int index = cache.matches[visible];
+                    string prefabPath = cache.prefabs[index];
+                    _prefabInstanceCounts.TryGetValue(prefabPath, out int instanceCount);
+                    Rect card = new Rect(
+                        gridRect.x + column * (cardWidth + cardGap),
+                        gridRect.y + gridRow * rowStride,
+                        cardWidth,
+                        cardHeight);
+                    var e = Event.current;
+
+                    string usageText = T("In geöffneten Szenen verwendet: ", "Used in open scenes: ") + instanceCount;
+                    GUI.Box(card, new GUIContent("", prefabPath + "\n" + usageText), EditorStyles.helpBox);
+                    if (e.type == EventType.Repaint)
+                    {
+                        bool selected = selectedAssetPath == prefabPath;
+                        bool hovered = card.Contains(e.mousePosition);
+                        if (selected || hovered)
+                        {
+                            Color tint = selected
+                                ? new Color(0.20f, 0.55f, 0.85f, 0.32f)
+                                : new Color(1f, 1f, 1f, 0.055f);
+                            EditorGUI.DrawRect(new Rect(card.x + 1f, card.y + 1f, card.width - 2f, card.height - 2f), tint);
+                        }
+
+                        if (cache.cardContents[index] == null)
+                        {
+                            string shortName = System.IO.Path.GetFileNameWithoutExtension(prefabPath);
+                            cache.cardContents[index] = new GUIContent(shortName, prefabPath);
+                        }
+                        Rect iconRect = new Rect(card.x + 6f, card.y + 6f, card.width - 12f, _prefabPreviewSize);
+                        EditorGUI.DrawRect(iconRect, new Color(0f, 0f, 0f, 0.14f));
+                        Texture icon = GetPrefabCardPreview(cache, index);
+                        if (icon != null)
+                            GUI.DrawTexture(iconRect, icon, ScaleMode.ScaleToFit, true);
+                        Rect nameRect = new Rect(card.x + 7f, iconRect.yMax + 5f, card.width - 14f, 32f);
+                        GUI.Label(nameRect, cache.cardContents[index], _stPrefabCardName);
+                        Rect badgeRect = new Rect(iconRect.xMax - 36f, iconRect.yMax - 18f, 33f, 14f);
+                        EditorGUI.DrawRect(badgeRect, new Color(0f, 0f, 0f, 0.28f));
+                        GUI.Label(badgeRect, new GUIContent("× " + instanceCount, usageText), _stBadge);
+                    }
+                    if (e.type == EventType.MouseDown && e.button == 0 && card.Contains(e.mousePosition))
+                    {
+                        var asset = AssetDatabase.LoadAssetAtPath<GameObject>(prefabPath);
+                        if (asset == null) continue;
+                        if (e.clickCount == 2)
+                        {
+                            GUIUtility.hotControl = 0;
+                            _pendingAssetDrag = null;
+                            _pendingAssetDragTab = null;
+                            AssetDatabase.OpenAsset(asset);
+                        }
+                        else
+                        {
+                            GUIUtility.keyboardControl = 0;
+                            GUIUtility.hotControl = _prefabCardControlId;
+                            _pendingAssetDrag = asset;
+                            _pendingAssetDragTab = tab;
+                            _assetDragStart = GUIUtility.GUIToScreenPoint(e.mousePosition);
+                        }
+                        e.Use();
+                    }
                 }
             }
         }
         if (remove != null)
         {
             tab.folderGuids.Remove(remove);
+            if (tab.selectedProjectFolderGuid == remove) tab.selectedProjectFolderGuid = "";
             StateChanged();
         }
-        var current = Event.current;
-        if (current.type == EventType.MouseDrag && _pendingAssetDrag != null && Vector2.Distance(current.mousePosition, _assetDragStart) > DragThreshold)
-        {
-            DragAndDrop.PrepareStartDrag();
-            DragAndDrop.objectReferences = new[] { _pendingAssetDrag };
-            DragAndDrop.StartDrag(_pendingAssetDrag.name);
-            _pendingAssetDrag = null;
-            current.Use();
-        }
-        if (current.type == EventType.MouseUp || current.type == EventType.DragExited) _pendingAssetDrag = null;
     }
 
     void HandleWindowDragDrop(TabData tab)
@@ -1996,23 +3177,27 @@ public class HierarchyOrganizerWindow : EditorWindow
         var ev = Event.current.type;
         if (ev == EventType.DragUpdated)
         {
-            bool hasGo = DragAndDrop.objectReferences.Any(o => (o is GameObject go && IsObjectInContext(go)) || IsProjectFolder(o));
+            ClearEntryDropTarget();
+            bool hasGo = CanAcceptTabDrop(tab);
             DragAndDrop.visualMode = hasGo ? DragAndDropVisualMode.Copy : DragAndDropVisualMode.Rejected;
             Event.current.Use();
         }
         else if (ev == EventType.DragPerform)
         {
+            if (!CanAcceptTabDrop(tab)) return;
             DragAndDrop.AcceptDrag();
-            int added = AddDroppedFolders(tab);
+            int added = IsProjectTab(tab) ? AddDroppedFolders(tab) : 0;
             foreach (var obj in DragAndDrop.objectReferences)
             {
-                if (obj is GameObject go && IsObjectInContext(go))
+                if (!IsProjectTab(tab) && obj is GameObject go &&
+                    !EditorUtility.IsPersistent(go) && IsObjectInContext(go))
                 {
                     EntityId id = go.GetEntityId();
                     if (!tab.pinnedIDs.Contains(id))
                     {
                         AutoNameEmptyTab(tab, go);
                         tab.pinnedIDs.Add(id);
+                        _expanded.Add(id);
                         added++;
                     }
                 }
@@ -2024,94 +3209,6 @@ public class HierarchyOrganizerWindow : EditorWindow
             }
             Event.current.Use();
         }
-    }
-
-    // ══════════════════════════════════════════════
-    //  History View
-    // ══════════════════════════════════════════════
-
-    void DrawHistoryView(TabData tab)
-    {
-        if (tab.history.Count == 0)
-        {
-            DrawHint("Wähle GameObjects in der Szene aus, um den Verlauf zu befüllen.");
-            return;
-        }
-        for (int i = 0; i < tab.history.Count; i++)
-            DrawHistoryEntry(tab, i);
-    }
-
-    void DrawHistoryEntry(TabData tab, int index)
-    {
-        var  entry    = tab.history[index];
-        var  go       = entry.Resolve();
-        bool exists   = go != null;
-        if (exists) RegisterSelectionRow(go);
-        bool selected = exists && _selectedIDs.Contains(go.GetEntityId());
-        bool isFav    = exists && _favorites.Contains(go.GetEntityId());
-
-        var  rect  = GUILayoutUtility.GetRect(0, 40, GUILayout.ExpandWidth(true));
-        bool hover = rect.Contains(Event.current.mousePosition);
-
-        EditorGUI.DrawRect(rect, selected ? ColSelected : hover ? ColHover
-            : index % 2 == 0 ? ColBg : ColRowAlt);
-
-        // Track hovered object for tooltip
-        if (hover && exists && _showTooltips)
-        {
-            _hoveredGO = go;
-            _hoverMousePos = Event.current.mousePosition;
-        }
-
-        var tabCol = GetTabColor(tab);
-        EditorGUI.DrawRect(new Rect(rect.x, rect.y + 4, 3, rect.height - 8), exists ? tabCol : Color.gray);
-
-        var icon = exists
-            ? EditorGUIUtility.ObjectContent(go, typeof(GameObject)).image
-            : EditorGUIUtility.IconContent("GameObject Icon").image;
-        if (icon != null)
-            GUI.DrawTexture(new Rect(rect.x + 8, rect.y + 10, 20, 20), icon, ScaleMode.ScaleToFit);
-
-        var old = GUI.color;
-        GUI.color = exists ? (selected ? Color.white : new Color(0.95f, 0.95f, 0.95f))
-                           : new Color(0.60f, 0.60f, 0.60f);
-        GUI.Label(new Rect(rect.x + 32, rect.y + 4,  rect.width - 65, 18), entry.name,      _stEntryName ?? EditorStyles.label);
-        GUI.color = new Color(0.70f, 0.70f, 0.70f);
-        GUI.Label(new Rect(rect.x + 32, rect.y + 22, rect.width - 65, 14), entry.scenePath, _stEntryPath ?? EditorStyles.miniLabel);
-        GUI.color = old;
-
-        if (!exists)
-        {
-            GUI.color = new Color(0.95f, 0.45f, 0.35f);
-            GUI.Label(new Rect(rect.xMax - 60, rect.y + 14, 52, 14), "gelöscht", EditorStyles.miniLabel);
-            GUI.color = old;
-        }
-
-        if (exists)
-        {
-            GUI.color = isFav ? ColFav : new Color(0.5f, 0.5f, 0.5f, hover ? 0.9f : 0f);
-            if (GUI.Button(new Rect(rect.xMax - 18, rect.y + 12, 16, 16), "★", EditorStyles.miniLabel))
-            {
-                if (isFav) _favorites.Remove(go.GetEntityId());
-                else       _favorites.Add(go.GetEntityId());
-            }
-            GUI.color = old;
-        }
-
-        if (hover)
-        {
-            GUI.color = new Color(0.9f, 0.4f, 0.4f);
-            if (GUI.Button(new Rect(rect.xMax - 36, rect.y + 12, 16, 16), "×", EditorStyles.miniLabel))
-            {
-                tab.history.RemoveAt(index);
-                StateChanged();
-                GUI.color = old;
-                return;
-            }
-            GUI.color = old;
-        }
-
-        if (exists) HandleEntryEvents(rect, go, tab);
     }
 
     // ══════════════════════════════════════════════
@@ -2206,9 +3303,146 @@ public class HierarchyOrganizerWindow : EditorWindow
         }
     }
 
-    void HandleEntryEvents(Rect rect, GameObject go, TabData tab)
+    List<GameObject> GetDraggedSceneRoots()
+    {
+        var dragged = DragAndDrop.objectReferences.OfType<GameObject>()
+            .Where(item => item != null && !EditorUtility.IsPersistent(item) && IsObjectInContext(item))
+            .Distinct().ToList();
+        if (dragged.Count == 0) return dragged;
+        var draggedSet = new HashSet<GameObject>(dragged);
+        return dragged.Where(item =>
+        {
+            for (Transform parent = item.transform.parent; parent != null; parent = parent.parent)
+                if (draggedSet.Contains(parent.gameObject)) return false;
+            return true;
+        }).ToList();
+    }
+
+    bool CanDropEntriesOn(GameObject target, List<GameObject> dragged)
+    {
+        if (target == null || dragged == null || dragged.Count == 0) return false;
+        foreach (var item in dragged)
+        {
+            if (item == target || target.transform.IsChildOf(item.transform)) return false;
+            if (PrefabUtility.IsPartOfAnyPrefab(item)
+                && PrefabUtility.GetOutermostPrefabInstanceRoot(item) != item) return false;
+        }
+        return true;
+    }
+
+    void ReorderPinnedEntries(TabData tab, List<GameObject> dragged, EntityId targetID, bool after)
+    {
+        var moving = tab.pinnedIDs.Where(id => dragged.Any(go => go.GetEntityId() == id)).ToList();
+        if (moving.Count == 0) return;
+        foreach (var id in moving) tab.pinnedIDs.Remove(id);
+        int targetIndex = tab.pinnedIDs.IndexOf(targetID);
+        if (targetIndex < 0) targetIndex = tab.pinnedIDs.Count;
+        else if (after) targetIndex++;
+        tab.pinnedIDs.InsertRange(targetIndex, moving);
+        StateChanged();
+    }
+
+    void MoveHierarchyEntries(List<GameObject> dragged, GameObject target, int zone)
+    {
+        string action = zone == 1 ? "Move hierarchy objects into object" : "Reorder hierarchy objects";
+        Transform newParent = zone == 1 ? target.transform : target.transform.parent;
+        Undo.IncrementCurrentGroup();
+        int undoGroup = Undo.GetCurrentGroup();
+        Undo.SetCurrentGroupName(action);
+        Undo.RecordObjects(dragged.Select(item => item.transform).ToArray(), action);
+
+        foreach (var item in dragged)
+            if (item.transform.parent != newParent)
+                Undo.SetTransformParent(item.transform, newParent, action);
+
+        if (zone == 1)
+        {
+            foreach (var item in dragged) item.transform.SetAsLastSibling();
+            _expanded.Add(target.GetEntityId());
+        }
+        else
+        {
+            var ordered = newParent == null
+                ? _dataScene.GetRootGameObjects().ToList()
+                : newParent.Cast<Transform>().Select(child => child.gameObject).ToList();
+            ordered.RemoveAll(dragged.Contains);
+            int targetIndex = ordered.IndexOf(target);
+            if (targetIndex < 0) targetIndex = ordered.Count;
+            else if (zone == 2) targetIndex++;
+            ordered.InsertRange(targetIndex, dragged);
+            for (int i = 0; i < ordered.Count; i++) ordered[i].transform.SetSiblingIndex(i);
+        }
+
+        Undo.CollapseUndoOperations(undoGroup);
+        EditorSceneManager.MarkSceneDirty(_dataScene);
+        _hierarchyVersion++;
+        Repaint();
+    }
+
+    void ClearEntryDropTarget()
+    {
+        _entryDropTargetID = default;
+        _entryDropZone = -1;
+        _entryDropTab = null;
+    }
+
+    void HandleEntryEvents(Rect rect, GameObject go, TabData tab, bool pinnedRoot = false, int pinnedIndex = -1)
     {
         var e = Event.current;
+
+        if (e.type == EventType.Repaint && _entryDropTab == tab
+            && _entryDropTargetID == go.GetEntityId() && _entryDropZone >= 0)
+        {
+            Color marker = new Color(1f, 0.22f, 0.12f, 0.95f);
+            if (_entryDropZone == 1)
+            {
+                EditorGUI.DrawRect(new Rect(rect.x + 1f, rect.y + 1f, 3f, rect.height - 2f), marker);
+                EditorGUI.DrawRect(new Rect(rect.x + 1f, rect.y + 1f, rect.width - 2f, 1.5f), marker);
+                EditorGUI.DrawRect(new Rect(rect.x + 1f, rect.yMax - 2.5f, rect.width - 2f, 1.5f), marker);
+            }
+            else
+            {
+                float y = _entryDropZone == 0 ? rect.y : rect.yMax - 2f;
+                EditorGUI.DrawRect(new Rect(rect.x + 3f, y, rect.width - 6f, 2f), marker);
+            }
+        }
+
+        if ((e.type == EventType.DragUpdated || e.type == EventType.DragPerform) && rect.Contains(e.mousePosition))
+        {
+            var dragged = GetDraggedSceneRoots();
+            float relativeY = (e.mousePosition.y - rect.y) / Mathf.Max(1f, rect.height);
+            int zone = relativeY < 0.25f ? 0 : relativeY > 0.75f ? 2 : 1;
+            bool valid = !tab.locked && CanDropEntriesOn(go, dragged);
+            var internalDrag = DragAndDrop.GetGenericData(EntryDragKey) as OrganizerEntryDrag;
+            bool reorderPins = valid && zone != 1 && pinnedRoot && internalDrag != null
+                && internalDrag.tab == tab && internalDrag.pinnedRoot
+                && dragged.All(item => tab.pinnedIDs.Contains(item.GetEntityId()));
+
+            DragAndDrop.visualMode = valid ? DragAndDropVisualMode.Move : DragAndDropVisualMode.Rejected;
+            if (valid)
+            {
+                _entryDropTargetID = go.GetEntityId();
+                _entryDropZone = zone;
+                _entryDropTab = tab;
+                Repaint();
+            }
+            if (e.type == EventType.DragPerform && valid)
+            {
+                DragAndDrop.AcceptDrag();
+                if (reorderPins) ReorderPinnedEntries(tab, dragged, go.GetEntityId(), zone == 2);
+                else MoveHierarchyEntries(dragged, go, zone);
+                DragAndDrop.SetGenericData(EntryDragKey, null);
+                ClearEntryDropTarget();
+            }
+            e.Use();
+            return;
+        }
+
+        if (e.type == EventType.DragExited)
+        {
+            ClearEntryDropTarget();
+            Repaint();
+        }
 
         if (e.type == EventType.ContextClick && rect.Contains(e.mousePosition))
         {
@@ -2224,12 +3458,20 @@ public class HierarchyOrganizerWindow : EditorWindow
 
         if (e.type == EventType.MouseDown && e.button == 0 && rect.Contains(e.mousePosition))
         {
-            _dragSourceID = go.GetEntityId();
+            EntityId clickedID = go.GetEntityId();
+            double clickTime = EditorApplication.timeSinceStartup;
+            bool isRealDoubleClick = _lastClickedObjectID == clickedID
+                && _lastClickedObjectTime >= 0
+                && clickTime - _lastClickedObjectTime <= 0.35;
+            _lastClickedObjectID = clickedID;
+            _lastClickedObjectTime = clickTime;
+
+            _dragSourceID = clickedID;
             _dragStartPos = e.mousePosition;
 
             SelectEntry(go, e.control || e.command, e.shift);
 
-            if (e.clickCount == 2)
+            if (isRealDoubleClick)
             {
                 EditorGUIUtility.PingObject(go);
                 if (SceneView.lastActiveSceneView != null)
@@ -2258,6 +3500,12 @@ public class HierarchyOrganizerWindow : EditorWindow
             _pendingSingleSelection = null;
             _dragSourceID = default;
             DragAndDrop.PrepareStartDrag();
+            DragAndDrop.SetGenericData(EntryDragKey, new OrganizerEntryDrag
+            {
+                tab = tab,
+                sourceID = go.GetEntityId(),
+                pinnedRoot = pinnedRoot
+            });
 
             if (_selectedIDs.Contains(go.GetEntityId()) && Selection.gameObjects.Length > 1)
             {
@@ -2294,13 +3542,28 @@ public class HierarchyOrganizerWindow : EditorWindow
 
         if (!isMulti)
         {
-            menu.AddItem(new GUIContent("Auswählen"), false, () => Selection.activeGameObject = go);
-            menu.AddItem(new GUIContent("In Hierarchy finden"), false, () => EditorGUIUtility.PingObject(go));
-            menu.AddItem(new GUIContent("In Scene fokussieren"), false, () =>
+            menu.AddItem(new GUIContent(T("Auswählen", "Select")), false, () => Selection.activeGameObject = go);
+            menu.AddItem(new GUIContent(T("In Hierarchy finden", "Find in Hierarchy")), false, () => EditorGUIUtility.PingObject(go));
+            menu.AddItem(new GUIContent(T("In Scene fokussieren", "Focus in Scene")), false, () =>
             {
                 Selection.activeGameObject = go;
                 if (SceneView.lastActiveSceneView != null)
                     SceneView.lastActiveSceneView.FrameSelected();
+            });
+            menu.AddItem(new GUIContent(T("Objekt umbenennen", "Rename object")), false, () =>
+            {
+                Selection.activeGameObject = go;
+                HierarchyOrganizerRenameWindow.ShowWindow(go, _englishUI);
+            });
+            menu.AddSeparator("");
+        }
+
+        if (!tab.locked)
+        {
+            menu.AddItem(new GUIContent(T("Erstellen …", "Create …")), false, () =>
+            {
+                Selection.activeGameObject = go;
+                ShowCreateObjectMenu();
             });
             menu.AddSeparator("");
         }
@@ -2370,13 +3633,21 @@ public class HierarchyOrganizerWindow : EditorWindow
             Selection.objects = newDups.ToArray();
         });
 
-        // Löschen
-        menu.AddItem(new GUIContent(isMulti ? $"Löschen ({targets.Length} Objekte)" : "Löschen"), false, () =>
+        menu.AddItem(new GUIContent(isMulti
+            ? T($"Objekte aus Szene löschen ({targets.Length})", $"Delete objects from scene ({targets.Length})")
+            : T("Objekt aus Szene löschen", "Delete object from scene")), false, () =>
         {
-            foreach (var t in targets)
+            foreach (var target in targets)
             {
-                if (t != null) Undo.DestroyObjectImmediate(t);
+                if (target == null) continue;
+                EntityId id = target.GetEntityId();
+                foreach (var organizerTab in _tabs) organizerTab.pinnedIDs.Remove(id);
+                _favorites.Remove(id);
+                _customObjectColors.Remove(id);
+                _expanded.Remove(id);
+                Undo.DestroyObjectImmediate(target);
             }
+            StateChanged();
         });
 
         menu.AddSeparator("");
@@ -2392,6 +3663,7 @@ public class HierarchyOrganizerWindow : EditorWindow
                 if (!tab.pinnedIDs.Contains(tid))
                 {
                     tab.pinnedIDs.Add(tid);
+                    _expanded.Add(tid);
                     added++;
                 }
             }
@@ -2404,7 +3676,7 @@ public class HierarchyOrganizerWindow : EditorWindow
         });
 
         // Unpin aus diesem Tab
-        menu.AddItem(new GUIContent(isMulti ? $"Aus diesem Tab entfernen ({targets.Length} Objekte)" : "Aus diesem Tab entfernen (Unpin)"), false, () =>
+        menu.AddItem(new GUIContent(isMulti ? T($"Aus dem Tab entfernen ({targets.Length} Objekte)", $"Remove from tab ({targets.Length} objects)") : T("Aus dem Tab entfernen", "Remove from tab")), false, () =>
         {
             foreach (var t in targets)
             {
@@ -2430,6 +3702,7 @@ public class HierarchyOrganizerWindow : EditorWindow
                     if (!targetTab.pinnedIDs.Contains(tid))
                     {
                         targetTab.pinnedIDs.Add(tid);
+                        _expanded.Add(tid);
                         added++;
                     }
                 }
@@ -2449,36 +3722,40 @@ public class HierarchyOrganizerWindow : EditorWindow
     void ShowSettingsMenu()
     {
         var menu = new GenericMenu();
-        menu.AddItem(new GUIContent("Nach Updates suchen …"), false, HierarchyOrganizerUpdater.CheckForUpdates);
-        menu.AddDisabledItem(new GUIContent("Version " + HierarchyOrganizerUpdater.Version));
+        menu.AddItem(new GUIContent(T("Nach Updates suchen …", "Check for updates…")), false, HierarchyOrganizerUpdater.CheckForUpdates);
+        menu.AddDisabledItem(new GUIContent("Version " + HierarchyOrganizerUpdater.VersionName));
         menu.AddSeparator("");
 
-        menu.AddItem(new GUIContent("Design & Helligkeit/Modern Dark (Empfohlen)"), _currentTheme == ThemeMode.ModernDark, () => { _currentTheme = ThemeMode.ModernDark; StateChanged(); });
-        menu.AddItem(new GUIContent("Design & Helligkeit/Extra Hell"),              _currentTheme == ThemeMode.ExtraBright, () => { _currentTheme = ThemeMode.ExtraBright; StateChanged(); });
-        menu.AddItem(new GUIContent("Design & Helligkeit/Unity Native Skin"),       _currentTheme == ThemeMode.UnityNative, () => { _currentTheme = ThemeMode.UnityNative; StateChanged(); });
-        menu.AddItem(new GUIContent("Design & Helligkeit/High Contrast"),           _currentTheme == ThemeMode.HighContrast, () => { _currentTheme = ThemeMode.HighContrast; StateChanged(); });
-
-        menu.AddSeparator("");
-
-        menu.AddItem(new GUIContent("Zeilenhöhe/Kompakt (22px)"),  Mathf.Approximately(_rowHeight, 22f), () => { _rowHeight = 22f; StateChanged(); });
-        menu.AddItem(new GUIContent("Zeilenhöhe/Standard (26px)"), Mathf.Approximately(_rowHeight, 26f), () => { _rowHeight = 26f; StateChanged(); });
-        menu.AddItem(new GUIContent("Zeilenhöhe/Groß (30px)"),     Mathf.Approximately(_rowHeight, 30f), () => { _rowHeight = 30f; StateChanged(); });
+        menu.AddItem(new GUIContent(T("Design & Helligkeit/Modern Dark (Empfohlen)", "Theme & Brightness/Modern Dark (Recommended)")), _currentTheme == ThemeMode.ModernDark, () => { _currentTheme = ThemeMode.ModernDark; StateChanged(); });
+        menu.AddItem(new GUIContent(T("Design & Helligkeit/Extra Hell", "Theme & Brightness/Extra Bright")), _currentTheme == ThemeMode.ExtraBright, () => { _currentTheme = ThemeMode.ExtraBright; StateChanged(); });
+        menu.AddItem(new GUIContent(T("Design & Helligkeit/Unity Native Skin", "Theme & Brightness/Unity Native Skin")), _currentTheme == ThemeMode.UnityNative, () => { _currentTheme = ThemeMode.UnityNative; StateChanged(); });
+        menu.AddItem(new GUIContent(T("Design & Helligkeit/High Contrast", "Theme & Brightness/High Contrast")), _currentTheme == ThemeMode.HighContrast, () => { _currentTheme = ThemeMode.HighContrast; StateChanged(); });
 
         menu.AddSeparator("");
 
-        menu.AddItem(new GUIContent("Schnellfilter-Leiste anzeigen"), _showQuickFilterBar, () => { _showQuickFilterBar = !_showQuickFilterBar; StateChanged(); });
-        menu.AddItem(new GUIContent("Komponenten-Icons anzeigen"),   _showComponentIcons, () => { _showComponentIcons = !_showComponentIcons; StateChanged(); });
-        menu.AddItem(new GUIContent("Hierarchy-Baumlinien anzeigen"), _showHierarchyLines, () => { _showHierarchyLines = !_showHierarchyLines; StateChanged(); });
-        menu.AddItem(new GUIContent("Objekt-Info Tooltips anzeigen"), _showTooltips, () => { _showTooltips = !_showTooltips; StateChanged(); });
+        menu.AddItem(new GUIContent(T("Zeilenhöhe/Extrem kompakt (13px)", "Row Height/Ultra Compact (13px)")), Mathf.Approximately(_rowHeight, 13f), () => { _rowHeight = 13f; StateChanged(); });
+        menu.AddItem(new GUIContent(T("Zeilenhöhe/Sehr kompakt (16px)", "Row Height/Very Compact (16px)")), Mathf.Approximately(_rowHeight, 16f), () => { _rowHeight = 16f; StateChanged(); });
+        menu.AddItem(new GUIContent(T("Zeilenhöhe/Kompakt (22px)", "Row Height/Compact (22px)")), Mathf.Approximately(_rowHeight, 22f), () => { _rowHeight = 22f; StateChanged(); });
+        menu.AddItem(new GUIContent(T("Zeilenhöhe/Standard (26px)", "Row Height/Standard (26px)")), Mathf.Approximately(_rowHeight, 26f), () => { _rowHeight = 26f; StateChanged(); });
+        menu.AddItem(new GUIContent(T("Zeilenhöhe/Groß (30px)", "Row Height/Large (30px)")), Mathf.Approximately(_rowHeight, 30f), () => { _rowHeight = 30f; StateChanged(); });
 
         menu.AddSeparator("");
 
-        menu.AddItem(new GUIContent("Autosave/Aus"),                   !_autosaveEnabled, () => { _autosaveEnabled = false; StateChanged(); });
-        menu.AddItem(new GUIContent("Autosave/Alle 1 Minute"),         _autosaveEnabled && _autosaveIntervalMinutes == 1, () => { _autosaveEnabled = true; _autosaveIntervalMinutes = 1; StateChanged(); });
-        menu.AddItem(new GUIContent("Autosave/Alle 5 Minuten"),        _autosaveEnabled && _autosaveIntervalMinutes == 5, () => { _autosaveEnabled = true; _autosaveIntervalMinutes = 5; StateChanged(); });
-        menu.AddItem(new GUIContent("Autosave/Alle 15 Minuten"),       _autosaveEnabled && _autosaveIntervalMinutes == 15, () => { _autosaveEnabled = true; _autosaveIntervalMinutes = 15; StateChanged(); });
-        menu.AddItem(new GUIContent("Autosave/Jetzt speichern"),       false, () => { DoAutosave(); });
-        menu.AddItem(new GUIContent("Autosave/Backup-Ordner öffnen"),  false, () =>
+        menu.AddItem(new GUIContent(T("Schnellfilter-Leiste anzeigen", "Show quick-filter bar")), _showQuickFilterBar, () => { _showQuickFilterBar = !_showQuickFilterBar; StateChanged(); });
+        menu.AddItem(new GUIContent(T("Schnellfilter-Bezeichnungen anzeigen", "Show quick-filter labels")), _showQuickFilterLabels, () => { _showQuickFilterLabels = !_showQuickFilterLabels; StateChanged(); });
+        menu.AddItem(new GUIContent(T("Tag- und Layer-Filter anzeigen", "Show tag and layer filters")), _showTagLayerBar, () => { _showTagLayerBar = !_showTagLayerBar; StateChanged(); });
+        menu.AddItem(new GUIContent(T("Komponenten-Icons anzeigen", "Show component icons")), _showComponentIcons, () => { _showComponentIcons = !_showComponentIcons; StateChanged(); });
+        menu.AddItem(new GUIContent(T("Hierarchy-Baumlinien anzeigen", "Show hierarchy tree lines")), _showHierarchyLines, () => { _showHierarchyLines = !_showHierarchyLines; StateChanged(); });
+        menu.AddItem(new GUIContent(T("Objekt-Info Tooltips anzeigen", "Show object-info tooltips")), _showTooltips, () => { _showTooltips = !_showTooltips; StateChanged(); });
+
+        menu.AddSeparator("");
+
+        menu.AddItem(new GUIContent(T("Autosave/Aus", "Autosave/Off")), !_autosaveEnabled, () => { _autosaveEnabled = false; StateChanged(); });
+        menu.AddItem(new GUIContent(T("Autosave/Alle 1 Minute", "Autosave/Every minute")), _autosaveEnabled && _autosaveIntervalMinutes == 1, () => { _autosaveEnabled = true; _autosaveIntervalMinutes = 1; StateChanged(); });
+        menu.AddItem(new GUIContent(T("Autosave/Alle 5 Minuten", "Autosave/Every 5 minutes")), _autosaveEnabled && _autosaveIntervalMinutes == 5, () => { _autosaveEnabled = true; _autosaveIntervalMinutes = 5; StateChanged(); });
+        menu.AddItem(new GUIContent(T("Autosave/Alle 15 Minuten", "Autosave/Every 15 minutes")), _autosaveEnabled && _autosaveIntervalMinutes == 15, () => { _autosaveEnabled = true; _autosaveIntervalMinutes = 15; StateChanged(); });
+        menu.AddItem(new GUIContent(T("Autosave/Jetzt speichern", "Autosave/Save now")), false, () => { DoAutosave(); });
+        menu.AddItem(new GUIContent(T("Autosave/Backup-Ordner öffnen", "Autosave/Open backup folder")), false, () =>
         {
             string folder = GetAutosaveFolder();
             if (!System.IO.Directory.Exists(folder)) System.IO.Directory.CreateDirectory(folder);
@@ -2487,8 +3764,19 @@ public class HierarchyOrganizerWindow : EditorWindow
 
         menu.AddSeparator("");
         if (EditorPrefs.HasKey(PrefKey) || EditorPrefs.HasKey("HierarchyOrganizer_v3"))
-            menu.AddItem(new GUIContent("Szenendaten/Alte globale Tabs übernehmen..."), false, ImportLegacyState);
-        menu.AddDisabledItem(new GUIContent("Szenendaten/Werden mit der aktiven Szene gespeichert"));
+            menu.AddItem(new GUIContent(T("Szenendaten/Alte globale Tabs übernehmen...", "Scene Data/Import old global tabs…")), false, ImportLegacyState);
+        string sceneName = _dataScene.IsValid() ? _dataScene.name : "–";
+        menu.AddDisabledItem(new GUIContent(T("Szenendaten/Aktive Szene: ", "Scene Data/Active scene: ") + sceneName));
+        menu.AddDisabledItem(new GUIContent(T("Szenendaten/Werden mit der aktiven Szene gespeichert", "Scene Data/Saved with the active scene")));
+        menu.AddSeparator("Szenendaten/");
+        menu.AddItem(new GUIContent(T("Szenendaten/Auf Standard zurücksetzen...", "Scene Data/Reset to defaults…")), false, ResetActiveSceneOrganizerData);
+        if (_sceneStorage != null)
+            menu.AddItem(new GUIContent(T("Szenendaten/Aus der Szene entfernen...", "Scene Data/Remove from scene…")), false,
+                () => DeleteActiveSceneOrganizerData(false));
+        else
+            menu.AddDisabledItem(new GUIContent(T("Szenendaten/Aus der Szene entfernen...", "Scene Data/Remove from scene…")));
+        menu.AddItem(new GUIContent(T("Szenendaten/Alles löschen (inkl. Backups)...", "Scene Data/Delete everything (including backups)…")), false,
+            () => DeleteActiveSceneOrganizerData(true));
 
         menu.ShowAsContext();
     }
@@ -2529,7 +3817,7 @@ public class HierarchyOrganizerWindow : EditorWindow
         }
     }
 
-    void AddTab()
+    void AddTab(bool projectTab = false)
     {
         int newIdx = _tabs.Count % PresetColors.Length;
         string uniqueName = GetUniqueTabName("Tab " + (_tabs.Count + 1));
@@ -2538,6 +3826,7 @@ public class HierarchyOrganizerWindow : EditorWindow
             name       = uniqueName,
             viewMode   = 1, // Neuer Tab startet immer als leerer "Tab-Inhalt" (Pinned)
             iconEmoji  = "📁",
+            tabKind    = projectTab ? 1 : 0,
             colorIndex = newIdx
         });
         _selectedTab = _tabs.Count - 1;
@@ -2569,9 +3858,8 @@ public class HierarchyOrganizerWindow : EditorWindow
 
         if (_tabs.Count <= 1)
         {
-            _tabs[0].name = "Main";
+            _tabs[0].name = HierarchyTabName;
             _tabs[0].pinnedIDs.Clear();
-            _tabs[0].history.Clear();
             _tabs[0].notes = "";
             StateChanged();
             return;
@@ -2585,9 +3873,12 @@ public class HierarchyOrganizerWindow : EditorWindow
 
     void AutosaveCheck()
     {
+        double now = EditorApplication.timeSinceStartup;
+        if (now < _nextMaintenanceTime) return;
+        _nextMaintenanceTime = now + 0.25d;
+
         EnsureSceneContext();
         if (!_stateLoaded || _suspendPersistence || EditorApplication.isPlaying) return;
-        double now = EditorApplication.timeSinceStartup;
         // Szenenspeicherung ist unabhängig von den optionalen JSON-Sicherungen.
         if (_stateDirty && now >= _nextStateSync)
             SaveState();
@@ -2602,7 +3893,8 @@ public class HierarchyOrganizerWindow : EditorWindow
 
     void DoAutosave()
     {
-        if (!_stateLoaded || _suspendPersistence || EditorApplication.isPlaying || !_dataScene.IsValid() || !_dataScene.isLoaded) return;
+        if (!_stateLoaded || _suspendPersistence || _persistenceSuppressedUntilOrganizerChange
+            || EditorApplication.isPlaying || !_dataScene.IsValid() || !_dataScene.isLoaded) return;
         try
         {
             SaveState();
@@ -2656,6 +3948,88 @@ public class HierarchyOrganizerWindow : EditorWindow
             EditorUtility.DisplayDialog("Backup geladen", data.tabs.Count + " Tab(s) wiederhergestellt. Bitte die Szene speichern.", "OK");
         }
         catch (System.Exception ex) { EditorUtility.DisplayDialog("Fehler", ex.Message, "OK"); }
+    }
+
+    void ResetActiveSceneOrganizerData()
+    {
+        if (!_stateLoaded || !_dataScene.IsValid() || !_dataScene.isLoaded) return;
+        string sceneName = _dataScene.name;
+        if (!EditorUtility.DisplayDialog(
+            T("Organizer zurücksetzen?", "Reset Organizer?"),
+            T("Alle Tabs, Pins, Favoriten, Farben und Organizer-Einstellungen der Szene '" + sceneName
+                + "' werden auf Standard zurückgesetzt. Vorhandene Backup-Dateien bleiben erhalten.",
+              "All tabs, pins, favorites, colors, and Organizer settings for scene '" + sceneName
+                + "' will be reset to defaults. Existing backup files will be kept."),
+            T("Zurücksetzen", "Reset"), T("Abbrechen", "Cancel"))) return;
+
+        ResetSceneState();
+        _persistenceSuppressedUntilOrganizerChange = false;
+        _lastSavedJson = "";
+        _stateDirty = true;
+        _stateVersion++;
+        InvalidateViewCaches();
+        SaveState(true);
+        Repaint();
+        ShowNotification(new GUIContent(T("Organizer zurückgesetzt – Szene speichern.",
+            "Organizer reset — save the scene.")));
+    }
+
+    void DeleteActiveSceneOrganizerData(bool includeBackups)
+    {
+        if (!_stateLoaded || !_dataScene.IsValid() || !_dataScene.isLoaded) return;
+        string sceneName = _dataScene.name;
+        string message = includeBackups
+            ? T("Die Organizer-Daten der Szene '" + sceneName
+                    + "' und alle automatischen Backups dieser Szene werden endgültig gelöscht.",
+                "The Organizer data for scene '" + sceneName
+                    + "' and all automatic backups for this scene will be permanently deleted.")
+            : T("Die Organizer-Daten werden aus der Szene '" + sceneName
+                    + "' entfernt. Automatische Backups bleiben erhalten.",
+                "The Organizer data will be removed from scene '" + sceneName
+                    + "'. Automatic backups will be kept.");
+        if (!EditorUtility.DisplayDialog(
+            T("Szenendaten löschen?", "Delete scene data?"), message,
+            T("Löschen", "Delete"), T("Abbrechen", "Cancel"))) return;
+
+        bool removedSceneObject = _sceneStorage != null;
+        _writingState = true;
+        try
+        {
+            if (_sceneStorage != null)
+                Undo.DestroyObjectImmediate(_sceneStorage.gameObject);
+        }
+        finally
+        {
+            _sceneStorage = null;
+            _writingState = false;
+        }
+
+        string backupError = null;
+        if (includeBackups)
+        {
+            try
+            {
+                string folder = GetAutosaveFolder();
+                if (System.IO.Directory.Exists(folder)) System.IO.Directory.Delete(folder, true);
+            }
+            catch (System.Exception ex) { backupError = ex.Message; }
+        }
+
+        ResetSceneState();
+        _persistenceSuppressedUntilOrganizerChange = true;
+        _lastSavedJson = JsonUtility.ToJson(CaptureSaveData(out _));
+        _stateDirty = false;
+        _stateVersion++;
+        InvalidateViewCaches();
+        if (removedSceneObject) EditorSceneManager.MarkSceneDirty(_dataScene);
+        Repaint();
+
+        if (backupError != null)
+            EditorUtility.DisplayDialog(T("Backups konnten nicht gelöscht werden", "Backups could not be deleted"), backupError, "OK");
+        else
+            ShowNotification(new GUIContent(includeBackups
+                ? T("Szenendaten und Backups gelöscht – Szene speichern.", "Scene data and backups deleted — save the scene.")
+                : T("Szenendaten entfernt – Szene speichern.", "Scene data removed — save the scene.")));
     }
 
     void DrawObjectTooltip(GameObject prevHovered)
@@ -2879,12 +4253,12 @@ public class HierarchyOrganizerWindow : EditorWindow
         public bool showComponentIcons = true;
         public bool showHierarchyLines = true;
         public bool showQuickFilterBar = true;
+        public bool showQuickFilterLabels;
+        public bool showTagLayerBar;
         public bool showTooltips = true;
         public int autosaveIntervalMinutes = 5;
         public bool autosaveEnabled = true;
         public bool autoNameTabs;
-        public bool recordEnabled = true;
-        public int maxHistory = 50;
         public bool globalSearch;
         public string globalQuery;
         public int colorFilterTab = -1;
@@ -2909,7 +4283,7 @@ public class HierarchyOrganizerWindow : EditorWindow
 
     void ResetSceneState()
     {
-        _tabs = new List<TabData> { new TabData { name = "Main", viewMode = 0, iconEmoji = "📁" } };
+        _tabs = new List<TabData> { new TabData { name = HierarchyTabName, viewMode = 0, iconEmoji = "📁" } };
         _selectedTab = 0;
         _favorites.Clear();
         _customObjectColors.Clear();
@@ -2917,11 +4291,11 @@ public class HierarchyOrganizerWindow : EditorWindow
         _currentTheme = ThemeMode.ModernDark;
         _rowHeight = 26f;
         _showComponentIcons = _showHierarchyLines = _showQuickFilterBar = _showTooltips = true;
+        _showQuickFilterLabels = false;
+        _showTagLayerBar = false;
         _autosaveIntervalMinutes = 5;
         _autosaveEnabled = true;
         _autoNameTabs = false;
-        _recordEnabled = true;
-        _maxHistory = 50;
         _globalSearch = false;
         _globalQuery = "";
         _globalScroll = _quickFilterScroll = Vector2.zero;
@@ -2936,6 +4310,7 @@ public class HierarchyOrganizerWindow : EditorWindow
         _dragSourceTab = _dragOverTab = -1;
         _lastAutosaveTime = EditorApplication.timeSinceStartup;
         _lastAutosaveLabel = "";
+        _nextMaintenanceTime = 0d;
     }
 
     static HashSet<EntityId> ReferencedIds(SaveData data)
@@ -2945,9 +4320,6 @@ public class HierarchyOrganizerWindow : EditorWindow
         {
             if (tab == null) continue;
             if (tab.pinnedIDs != null) ids.UnionWith(tab.pinnedIDs);
-            if (tab.history != null)
-                foreach (var entry in tab.history)
-                    if (entry != null) ids.Add(entry.entityId);
         }
         if (data.favorites != null) ids.UnionWith(data.favorites);
         if (data.expanded != null) ids.UnionWith(data.expanded);
@@ -2968,14 +4340,17 @@ public class HierarchyOrganizerWindow : EditorWindow
         foreach (var tab in data.tabs)
         {
             tab.folderGuids = tab.folderGuids ?? new List<string>();
+            // Ältere gespeicherte Projekt-Tabs hatten noch keinen festen Typ.
+            if (tab.folderGuids.Count > 0 && (tab.pinnedIDs?.Count ?? 0) == 0)
+                tab.tabKind = 1;
             tab.pinnedIDs = RemapIds(tab.pinnedIDs, map);
-            tab.history = (tab.history ?? new List<HistoryEntry>())
-                .Where(e => e != null && map.ContainsKey(e.entityId)).ToList();
-            foreach (var entry in tab.history) entry.entityId = map[entry.entityId];
+            if (tab.viewMode != 0 && tab.viewMode != 1)
+                tab.viewMode = 1;
             tab.renaming = false;
             tab.renameBuffer = tab.name;
             tab.notes = tab.notes ?? "";
             tab.searchQuery = tab.searchQuery ?? "";
+            tab.selectedProjectFolderGuid = tab.selectedProjectFolderGuid ?? "";
         }
         data.favorites = RemapIds(data.favorites, map);
         data.expanded = RemapIds(data.expanded, map);
@@ -3001,12 +4376,12 @@ public class HierarchyOrganizerWindow : EditorWindow
             showComponentIcons = _showComponentIcons,
             showHierarchyLines = _showHierarchyLines,
             showQuickFilterBar = _showQuickFilterBar,
+            showQuickFilterLabels = _showQuickFilterLabels,
+            showTagLayerBar = _showTagLayerBar,
             showTooltips = _showTooltips,
             autosaveIntervalMinutes = _autosaveIntervalMinutes,
             autosaveEnabled = _autosaveEnabled,
             autoNameTabs = _autoNameTabs,
-            recordEnabled = _recordEnabled,
-            maxHistory = _maxHistory,
             globalSearch = _globalSearch,
             globalQuery = _globalQuery,
             colorFilterTab = _sceneColorFilterTab == null ? -1 : _tabs.IndexOf(_sceneColorFilterTab)
@@ -3058,6 +4433,10 @@ public class HierarchyOrganizerWindow : EditorWindow
         RemapObjectIds(data, map);
         ResetSceneState();
         if (data.tabs.Count > 0) _tabs = data.tabs;
+        foreach (var tab in _tabs)
+            if (!IsProjectTab(tab) && string.Equals(tab.name?.Trim(), LegacyMainTabName,
+                    System.StringComparison.OrdinalIgnoreCase))
+                tab.name = HierarchyTabName;
         _selectedTab = Mathf.Clamp(data.selectedTab, 0, _tabs.Count - 1);
         _favorites = new HashSet<EntityId>(data.favorites);
         _expanded = new HashSet<EntityId>(data.expanded);
@@ -3067,22 +4446,23 @@ public class HierarchyOrganizerWindow : EditorWindow
         _showComponentIcons = data.showComponentIcons;
         _showHierarchyLines = data.showHierarchyLines;
         _showQuickFilterBar = data.showQuickFilterBar;
+        _showQuickFilterLabels = data.showQuickFilterLabels;
+        _showTagLayerBar = data.showTagLayerBar;
         _showTooltips = data.showTooltips;
         _autosaveIntervalMinutes = Mathf.Max(1, data.autosaveIntervalMinutes);
         _autosaveEnabled = data.schemaVersion < 5 || data.autosaveEnabled;
         _autoNameTabs = data.autoNameTabs;
-        _recordEnabled = data.schemaVersion < 5 || data.recordEnabled;
-        _maxHistory = data.schemaVersion < 5 ? 50 : Mathf.Max(1, data.maxHistory);
-        _globalSearch = data.globalSearch;
-        _globalQuery = data.globalQuery ?? "";
-        if (data.schemaVersion >= 5 && data.colorFilterTab >= 0 && data.colorFilterTab < _tabs.Count)
-            _sceneColorFilterTab = _tabs[data.colorFilterTab];
+        _globalSearch = false;
+        _globalQuery = "";
+        _sceneColorFilterTab = null;
+        _persistenceSuppressedUntilOrganizerChange = false;
         RebuildTabColorGroups();
     }
 
     void SaveState(bool forceCreate = false)
     {
         if (!_stateLoaded || _writingState || _suspendPersistence || EditorApplication.isPlaying
+            || (_sceneStorage == null && _persistenceSuppressedUntilOrganizerChange)
             || (!_stateDirty && !forceCreate) || !_dataScene.IsValid() || !_dataScene.isLoaded
             || EditorSceneManager.IsPreviewScene(_dataScene)) return;
         _writingState = true;
@@ -3127,6 +4507,7 @@ public class HierarchyOrganizerWindow : EditorWindow
         ResetSceneState();
         if (!_dataScene.IsValid() || !_dataScene.isLoaded || EditorSceneManager.IsPreviewScene(_dataScene)) return;
         _sceneStorage = FindSceneStorage(_dataScene);
+        _persistenceSuppressedUntilOrganizerChange = _sceneStorage == null;
         try
         {
             if (_sceneStorage != null && !string.IsNullOrEmpty(_sceneStorage.stateJson))
@@ -3230,7 +4611,8 @@ public class HierarchyOrganizerWindow : EditorWindow
     {
         if (_stTabActive != null && _stTabNormal != null && _stHeader != null &&
             _stEntryName != null && _stEntryPath != null && _stBadge != null &&
-            _stNotes != null && _stFilterChip != null && _stFilterChipActive != null)
+            _stNotes != null && _stFilterChip != null && _stFilterChipActive != null &&
+            _stPrefabCardName != null)
         {
             return;
         }
@@ -3299,6 +4681,15 @@ public class HierarchyOrganizerWindow : EditorWindow
             fontStyle = FontStyle.Bold,
             fixedHeight = 18,
             normal = { textColor = Color.white }
+        };
+
+        _stPrefabCardName = new GUIStyle(EditorStyles.miniLabel)
+        {
+            fontSize = 10,
+            alignment = TextAnchor.MiddleLeft,
+            wordWrap = true,
+            clipping = TextClipping.Clip,
+            normal = { textColor = new Color(0.84f, 0.84f, 0.84f) }
         };
     }
 }
@@ -3425,6 +4816,72 @@ public class TabColorPickerPopup : EditorWindow
             _tab.name = _parent.GetUniqueTabName(_tab.name, _tab);
             _parent.StateChanged();
         }
+    }
+}
+
+public sealed class HierarchyOrganizerRenameWindow : EditorWindow
+{
+    GameObject _target;
+    string _nameBuffer;
+    bool _english;
+    bool _focusField = true;
+
+    public static void ShowWindow(GameObject target, bool english)
+    {
+        if (target == null) return;
+        var window = CreateInstance<HierarchyOrganizerRenameWindow>();
+        window._target = target;
+        window._nameBuffer = target.name;
+        window._english = english;
+        window.titleContent = new GUIContent(english ? "Rename Object" : "Objekt umbenennen");
+        window.minSize = window.maxSize = new Vector2(320f, 82f);
+        window.ShowUtility();
+    }
+
+    void OnGUI()
+    {
+        if (_target == null)
+        {
+            Close();
+            return;
+        }
+
+        Event e = Event.current;
+        if (e.type == EventType.KeyDown && e.keyCode == KeyCode.Escape)
+        {
+            e.Use();
+            Close();
+            return;
+        }
+
+        GUILayout.Space(8f);
+        GUI.SetNextControlName("HierarchyOrganizerRenameField");
+        _nameBuffer = EditorGUILayout.TextField(_english ? "Name" : "Name", _nameBuffer);
+        if (_focusField)
+        {
+            EditorGUI.FocusTextInControl("HierarchyOrganizerRenameField");
+            _focusField = false;
+        }
+
+        bool confirmWithEnter = e.type == EventType.KeyDown &&
+            (e.keyCode == KeyCode.Return || e.keyCode == KeyCode.KeypadEnter);
+        EditorGUILayout.BeginHorizontal();
+        GUILayout.FlexibleSpace();
+        if (GUILayout.Button(_english ? "Cancel" : "Abbrechen", GUILayout.Width(85f))) Close();
+        if (GUILayout.Button(_english ? "Rename" : "Umbenennen", GUILayout.Width(90f)) || confirmWithEnter)
+        {
+            if (confirmWithEnter) e.Use();
+            string nextName = (_nameBuffer ?? "").Trim();
+            if (!string.IsNullOrEmpty(nextName) && nextName != _target.name)
+            {
+                Undo.RecordObject(_target, _english ? "Rename Object" : "Objekt umbenennen");
+                _target.name = nextName;
+                EditorUtility.SetDirty(_target);
+                EditorGUIUtility.PingObject(_target);
+            }
+            Close();
+        }
+        EditorGUILayout.EndHorizontal();
     }
 }
 #endif
