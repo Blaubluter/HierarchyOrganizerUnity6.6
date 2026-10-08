@@ -11,8 +11,8 @@ using UnityEngine.Networking;
 
 public static class HierarchyOrganizerUpdater
 {
-    public const string Version = "2.0.0";
-    public const string VersionName = "2.0 Master Update";
+    public const string Version = "2.2.0";
+    public const string VersionName = "2.2";
     static bool English => EditorPrefs.GetBool("HierarchyOrganizer.LanguageEnglish", true);
     static string T(string german, string english) => English ? english : german;
     const string Repo = "Blaubluter/HierarchyOrganizerUnity6.6";
